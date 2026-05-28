@@ -8,6 +8,7 @@ from lets_plot import *
 from sklearn.model_selection import train_test_split, ParameterSampler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import root_mean_squared_error, r2_score
+from sklearn.preprocessing import OrdinalEncoder
 import xgboost as xgb
 from xgboost import XGBRegressor
 
@@ -32,6 +33,7 @@ RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
 
 LetsPlot.setup_html()
 use_log_target = True  # Set True to train on log(price) and inverse-transform predictions
+school_label_encoders = {}
 ```
 
 # 1. Load Data
@@ -78,6 +80,26 @@ def convert_to_latlon(row):
         return pd.Series({'Longitude': lon, 'Latitude': lat})
     except Exception:
         return pd.Series({'Longitude': None, 'Latitude': None})
+
+
+def fit_school_label_encoders(df: pd.DataFrame, cols):
+    encoders = {}
+    for col in cols:
+        values = df[col].fillna('missing').astype(str).to_numpy().reshape(-1, 1)
+        enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+        enc.fit(values)
+        encoders[col] = enc
+    return encoders
+
+
+def apply_school_label_encoders(df: pd.DataFrame, encoders):
+    df = df.copy()
+    for col, enc in encoders.items():
+        if col not in df.columns:
+            continue
+        values = df[col].fillna('missing').astype(str).to_numpy().reshape(-1, 1)
+        df[f'{col}_code'] = enc.transform(values).astype(int).ravel()
+    return df
 
 
 def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
@@ -295,9 +317,9 @@ if assign_school_boundaries_to_houses is not None:
         ]
         if len(school_label_cols) > 0:
             housing_pd = housing.to_pandas()
-            for col in school_label_cols:
-                housing_pd[col] = housing_pd[col].fillna('missing').astype('category')
-                housing_pd[f'{col}_code'] = housing_pd[col].cat.codes
+            school_label_encoders = fit_school_label_encoders(housing_pd, school_label_cols)
+            housing_pd = apply_school_label_encoders(housing_pd, school_label_encoders)
+            housing_pd = housing_pd.drop(columns=school_label_cols)
             housing = pl.from_pandas(housing_pd)
         print('Assigned school boundaries: elementary, middle, and high school.')
     except Exception as e:
@@ -375,7 +397,7 @@ def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_roun
         cv_results = xgb.cv(
             params=cv_params,
             dtrain=dtrain,
-            num_boost_round=1000,
+            num_boost_round=1500,
             nfold=nfold,
             early_stopping_rounds=early_stopping_rounds,
             seed=random_state,
@@ -405,13 +427,13 @@ def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_roun
     return best_result
 
 param_grid = {
-    'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],
-    'max_depth': [4, 6, 8, 10],
-    'subsample': [0.6, 0.7, 0.8, 0.9, 1.0],
-    'colsample_bytree': [0.6, 0.7, 0.8, 0.9, 1.0],
-    'min_child_weight': [1, 3, 5, 7],
-    'reg_alpha': [0.0, 0.1, 0.5, 1.0],
-    'reg_lambda': [0.5, 1.0, 1.5, 2.0],
+    'learning_rate': [0.01, 0.03, 0.05],
+    'max_depth': [3, 4, 5, 6],
+    'subsample': [0.6, 0.7, 0.8],
+    'colsample_bytree': [0.6, 0.7, 0.8],
+    'min_child_weight': [1, 3, 5],
+    'reg_alpha': [0.0, 0.1, 0.5],
+    'reg_lambda': [0.5, 1.0, 1.5],
 }
 
 best_search = xgb_cv_best_params(
@@ -523,10 +545,11 @@ if assign_school_boundaries_to_houses is not None:
             if col in mini_X.columns
         ]
         if len(school_label_cols) > 0:
+            if not school_label_encoders:
+                raise ValueError('School label encoders have not been fitted on training data.')
             mini_X_pd = mini_X.to_pandas()
-            for col in school_label_cols:
-                mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype('category')
-                mini_X_pd[f'{col}_code'] = mini_X_pd[col].cat.codes
+            mini_X_pd = apply_school_label_encoders(mini_X_pd, school_label_encoders)
+            mini_X_pd = mini_X_pd.drop(columns=school_label_cols)
             mini_X = pl.from_pandas(mini_X_pd)
         print('Assigned school boundaries for holdout data.')
     except Exception as e:
