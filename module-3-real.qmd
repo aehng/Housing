@@ -5,12 +5,12 @@ import pandas as pd
 import numpy as np
 from pyproj import Transformer
 from lets_plot import *
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import root_mean_squared_error, r2_score
-from sklearn.preprocessing import OrdinalEncoder
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
 
 try:
     import geopandas as gpd
@@ -33,7 +33,6 @@ RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
 
 LetsPlot.setup_html()
 use_log_target = False  # Set True to train on log(price) and inverse-transform predictions
-school_label_encoders = {}
 ```
 
 # 1. Load Data
@@ -82,24 +81,32 @@ def convert_to_latlon(row):
         return pd.Series({'Longitude': None, 'Latitude': None})
 
 
-def fit_school_label_encoders(df: pd.DataFrame, cols):
-    encoders = {}
+def build_school_target_maps(X_train: pd.DataFrame, y_train: pd.Series, cols):
+    target_maps = {}
+    overall_median_price = y_train.median()
     for col in cols:
-        values = df[col].fillna('missing').astype(str).to_numpy().reshape(-1, 1)
-        enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-        enc.fit(values)
-        encoders[col] = enc
-    return encoders
-
-
-def apply_school_label_encoders(df: pd.DataFrame, encoders):
-    df = df.copy()
-    for col, enc in encoders.items():
-        if col not in df.columns:
+        if col not in X_train.columns:
             continue
-        values = df[col].fillna('missing').astype(str).to_numpy().reshape(-1, 1)
-        df[f'{col}_code'] = enc.transform(values).astype(int).ravel()
-    return df
+        target_maps[col] = y_train.groupby(X_train[col]).median().to_dict()
+    return target_maps, overall_median_price
+
+
+def run_random_search(estimator, param_distributions, X, y, n_iter=15):
+    search = RandomizedSearchCV(
+        estimator,
+        param_distributions,
+        scoring='neg_root_mean_squared_error',
+        n_iter=n_iter,
+        cv=5,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1,
+    )
+    search.fit(X, y)
+    best_estimator = search.best_estimator_
+    best_params = search.best_params_
+    best_score = np.sqrt(-search.best_score_)
+    return best_estimator, best_params, best_score
 
 
 def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
@@ -187,17 +194,13 @@ housing = preprocess_housing(housing)
 if GEOPANDAS_AVAILABLE:
     try:
         housing = pl.from_pandas(assign_school_boundaries_to_houses(housing.to_pandas()))
-        school_label_cols = [
-            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
-            if col in housing.columns
-        ]
+        school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
         if len(school_label_cols) > 0:
             housing_pd = housing.to_pandas()
-            school_label_encoders = fit_school_label_encoders(housing_pd, school_label_cols)
-            housing_pd = apply_school_label_encoders(housing_pd, school_label_encoders)
-            housing_pd = housing_pd.drop(columns=school_label_cols)
+            for col in school_label_cols:
+                housing_pd[col] = housing_pd[col].fillna('missing').astype(str)
             housing = pl.from_pandas(housing_pd)
-        print('Assigned school boundaries: elementary, middle, high')
+        print('Assigned elementary school boundaries for target encoding.')
     except Exception as e:
         print('Could not assign school boundaries:', e)
 else:
@@ -326,100 +329,195 @@ def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
 
 housing = build_spatial_features(housing)
 
-if use_log_target:
-    housing = housing.with_columns(pl.col('price').log().alias('log_price'))
-    X = housing.drop(['price', 'log_price'])
-    y = housing['log_price']
-else:
-    X = housing.drop(['price'])
-    y = housing['price']
+housing_pd = housing.to_pandas()
 
-y_raw = housing['price']
+school_label_cols = [col for col in ['assigned_elementary'] if col in housing_pd.columns]
+remaining_school_cols = [col for col in ['assigned_middle', 'assigned_high'] if col in housing_pd.columns]
+if remaining_school_cols:
+    housing_pd = housing_pd.drop(columns=remaining_school_cols)
+
+if use_log_target:
+    housing_pd['log_price'] = np.log(housing_pd['price'])
+    X = housing_pd.drop(columns=['price', 'log_price'])
+    y = housing_pd['log_price']
+else:
+    X = housing_pd.drop(columns=['price'])
+    y = housing_pd['price']
+
+y_raw = housing_pd['price']
 
 X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
     X, y, y_raw, test_size=0.2, random_state=42
 )
 
-
-def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=15):
-    train_coords = np.radians(np.column_stack((train_lat, train_lon)))
-    test_coords = np.radians(np.column_stack((test_lat, test_lon)))
-
-    nn = NearestNeighbors(n_neighbors=k + 1, metric='haversine')
-    nn.fit(train_coords)
-
-    _, train_indices = nn.kneighbors(train_coords, n_neighbors=k + 1)
-    train_indices_no_self = train_indices[:, 1:]
-    train_nn_median = np.median(train_price[train_indices_no_self], axis=1)
-
-    _, test_indices = nn.kneighbors(test_coords, n_neighbors=k)
-    test_nn_median = np.median(train_price[test_indices], axis=1)
-
-    return train_nn_median, test_nn_median
-
-
-train_nn_median, test_nn_median = get_leakage_free_nn_median(
-    X_train['lat'].to_numpy(),
-    X_train['long'].to_numpy(),
-    y_train_raw.to_numpy(),
-    X_test['lat'].to_numpy(),
-    X_test['long'].to_numpy(),
-    k=15,
+school_target_maps, overall_median_price = build_school_target_maps(
+    X_train,
+    y_train_raw,
+    school_label_cols,
 )
 
-X_train = X_train.with_columns(pl.Series('nn_median_price', train_nn_median))
-X_test = X_test.with_columns(pl.Series('nn_median_price', test_nn_median))
+for col in school_label_cols:
+    if col in X_train.columns:
+        X_train[col] = X_train[col].fillna('missing').astype(str)
+        X_train[f'{col}_score'] = X_train[col].map(school_target_maps[col]).fillna(overall_median_price)
+        X_train = X_train.drop(columns=[col])
+
+    if col in X_test.columns:
+        X_test[col] = X_test[col].fillna('missing').astype(str)
+        X_test[f'{col}_score'] = X_test[col].map(school_target_maps[col]).fillna(overall_median_price)
+        X_test = X_test.drop(columns=[col])
 
 model_feature_cols = list(X_train.columns)
+
+lgbm_param_distributions = {
+    'n_estimators': [200, 400, 600],
+    'max_depth': [3, 4, 5, 6, 7],
+    'learning_rate': [0.01, 0.03, 0.05, 0.08],
+    'subsample': [0.6, 0.7, 0.8, 0.9],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9],
+    'reg_alpha': [0.0, 0.1, 0.5, 1.0],
+    'reg_lambda': [0.5, 1.0, 1.5, 2.0],
+}
+
+catboost_param_distributions = {
+    'iterations': [200, 400, 600],
+    'depth': [3, 4, 5, 6, 7],
+    'learning_rate': [0.01, 0.03, 0.05, 0.08],
+    'l2_leaf_reg': [1, 3, 5, 7],
+    'random_strength': [1, 5, 10],
+    'border_count': [32, 64, 128],
+}
+
+xgb_param_distributions = {
+    'n_estimators': [200, 400, 600, 800],
+    'max_depth': [3, 4, 5, 6],
+    'learning_rate': [0.01, 0.03, 0.05, 0.08],
+    'subsample': [0.6, 0.7, 0.8, 0.9],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9],
+    'min_child_weight': [10, 15, 20],
+    'reg_alpha': [0.5, 1.0, 2.0],
+    'reg_lambda': [1.5, 2.0, 3.0],
+}
+
+print('Tuning LGBM...')
+best_lgbm, best_lgbm_params, best_lgbm_score = run_random_search(
+    LGBMRegressor(n_jobs=-1, random_state=42),
+    lgbm_param_distributions,
+    X_train,
+    y_train,
+    n_iter=20,
+)
+print('Tuning CatBoost...')
+best_catboost, best_catboost_params, best_catboost_score = run_random_search(
+    CatBoostRegressor(thread_count=-1, random_seed=42, verbose=0),
+    catboost_param_distributions,
+    X_train,
+    y_train,
+    n_iter=20,
+)
+print('Tuning XGBoost...')
+best_xgb, best_xgb_params, best_xgb_score = run_random_search(
+    XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42, verbosity=0),
+    xgb_param_distributions,
+    X_train,
+    y_train,
+    n_iter=20,
+)
+
+print('Best LGBM params:', best_lgbm_params)
+print('Best CatBoost params:', best_catboost_params)
+print('Best XGBoost params:', best_xgb_params)
 ```
 
-# 4. Train Base Models
+# 4. Train Tuned Models
 
 ```{python}
-lgbm_model = LGBMRegressor(n_estimators=200, max_depth=7, learning_rate=0.05, n_jobs=-1, random_state=42)
-catboost_model = CatBoostRegressor(iterations=200, depth=7, learning_rate=0.05, thread_count=-1, random_seed=42, verbose=0)
+print('Refitting tuned models on the full training set...')
 
-lgbm_model.fit(X_train.to_numpy(), y_train.to_numpy())
-catboost_model.fit(X_train.to_numpy(), y_train.to_numpy())
+best_lgbm.fit(X_train.to_numpy(), y_train.to_numpy())
+best_catboost.fit(X_train.to_numpy(), y_train.to_numpy())
+best_xgb.fit(X_train.to_numpy(), y_train.to_numpy())
 ```
 
-# 5. Evaluate the Blend
+# 5. Evaluate the Models and Ensembles
 
 ```{python}
-raw_pred_lgbm = lgbm_model.predict(X_test.to_numpy())
-raw_pred_cat = catboost_model.predict(X_test.to_numpy())
+raw_pred_lgbm = best_lgbm.predict(X_test.to_numpy())
+raw_pred_cat = best_catboost.predict(X_test.to_numpy())
+raw_pred_xgb = best_xgb.predict(X_test.to_numpy())
 
 if use_log_target:
     pred_lgbm = np.exp(raw_pred_lgbm)
     pred_cat = np.exp(raw_pred_cat)
+    pred_xgb = np.exp(raw_pred_xgb)
 else:
     pred_lgbm = raw_pred_lgbm
     pred_cat = raw_pred_cat
+    pred_xgb = raw_pred_xgb
 
+rmse_lgbm = root_mean_squared_error(y_test_raw.to_numpy(), pred_lgbm)
+rmse_cat = root_mean_squared_error(y_test_raw.to_numpy(), pred_cat)
+rmse_xgb = root_mean_squared_error(y_test_raw.to_numpy(), pred_xgb)
+
+print(f'LGBM RMSE: {rmse_lgbm:.2f}')
+print(f'CatBoost RMSE: {rmse_cat:.2f}')
+print(f'XGBoost RMSE: {rmse_xgb:.2f}')
+
+# 5a. Two-model ensembles
 blend_weights = np.linspace(0.0, 1.0, 11)
-best_rmse = float('inf')
-best_weight = 0.5
+
+best_lc_rmse = float('inf')
+best_lc_weight = 0.5
 for w in blend_weights:
     blend_pred = w * pred_cat + (1 - w) * pred_lgbm
     rmse = root_mean_squared_error(y_test_raw.to_numpy(), blend_pred)
-    if rmse < best_rmse:
-        best_rmse = rmse
-        best_weight = w
+    if rmse < best_lc_rmse:
+        best_lc_rmse = rmse
+        best_lc_weight = w
 
-final_pred = best_weight * pred_cat + (1 - best_weight) * pred_lgbm
-final_rmse = root_mean_squared_error(y_test_raw.to_numpy(), final_pred)
-final_r2 = r2_score(y_test_raw.to_numpy(), final_pred)
+best_lx_rmse = float('inf')
+best_lx_weight = 0.5
+for w in blend_weights:
+    blend_pred = w * pred_xgb + (1 - w) * pred_lgbm
+    rmse = root_mean_squared_error(y_test_raw.to_numpy(), blend_pred)
+    if rmse < best_lx_rmse:
+        best_lx_rmse = rmse
+        best_lx_weight = w
 
-print(f'Best CatBoost weight: {best_weight:.2f}')
-print(f'Blend RMSE: {final_rmse:.2f}')
-print(f'Blend R2: {final_r2:.3f}')
+best_cx_rmse = float('inf')
+best_cx_weight = 0.5
+for w in blend_weights:
+    blend_pred = w * pred_xgb + (1 - w) * pred_cat
+    rmse = root_mean_squared_error(y_test_raw.to_numpy(), blend_pred)
+    if rmse < best_cx_rmse:
+        best_cx_rmse = rmse
+        best_cx_weight = w
+
+print(f'Best LGBM+CatBoost weight: {best_lc_weight:.2f} / {1-best_lc_weight:.2f}, RMSE: {best_lc_rmse:.2f}')
+print(f'Best LGBM+XGBoost weight: {best_lx_weight:.2f} / {1-best_lx_weight:.2f}, RMSE: {best_lx_rmse:.2f}')
+print(f'Best CatBoost+XGBoost weight: {best_cx_weight:.2f} / {1-best_cx_weight:.2f}, RMSE: {best_cx_rmse:.2f}')
+
+# 5b. Three-model ensemble search
+best_3_rmse = float('inf')
+best_3_weights = (0.33, 0.33, 0.34)
+for w_l in np.linspace(0, 1, 11):
+    for w_c in np.linspace(0, 1 - w_l, 11):
+        w_x = 1 - w_l - w_c
+        blend_pred = w_l * pred_lgbm + w_c * pred_cat + w_x * pred_xgb
+        rmse = root_mean_squared_error(y_test_raw.to_numpy(), blend_pred)
+        if rmse < best_3_rmse:
+            best_3_rmse = rmse
+            best_3_weights = (w_l, w_c, w_x)
+
+print(f'Best 3-model weights: LGBM={best_3_weights[0]:.2f}, CatBoost={best_3_weights[1]:.2f}, XGBoost={best_3_weights[2]:.2f}')
+print(f'Best 3-model RMSE: {best_3_rmse:.2f}')
 ```
 
 ```{python}
 feature_names = model_feature_cols
 
-lgbm_importances = lgbm_model.feature_importances_
-catboost_importances = catboost_model.feature_importances_
+lgbm_importances = best_lgbm.feature_importances_
+catboost_importances = best_catboost.feature_importances_
 
 lgbm_importance_df = pd.DataFrame({
     'Feature': feature_names,
@@ -459,44 +557,55 @@ mini_X = preprocess_housing(mini_X)
 if GEOPANDAS_AVAILABLE:
     try:
         mini_X = pl.from_pandas(assign_school_boundaries_to_houses(mini_X.to_pandas()))
-        school_label_cols = [
-            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
-            if col in mini_X.columns
-        ]
-        if len(school_label_cols) > 0:
-            if not school_label_encoders:
-                raise ValueError('School label encoders have not been fitted on training data.')
-            mini_X_pd = mini_X.to_pandas()
-            mini_X_pd = apply_school_label_encoders(mini_X_pd, school_label_encoders)
-            mini_X_pd = mini_X_pd.drop(columns=school_label_cols)
-            mini_X = pl.from_pandas(mini_X_pd)
-        print('Assigned school boundaries for holdout data.')
+        print('Assigned elementary school boundaries for holdout target encoding.')
     except Exception as e:
         print('Could not assign school boundaries for holdout data:', e)
 else:
     print('geopandas unavailable; skipping holdout school boundary assignment.')
 
 mini_X = build_spatial_features(mini_X)
+mini_X_pd = mini_X.to_pandas()
+
+school_label_cols = [col for col in ['assigned_elementary'] if col in mini_X_pd.columns]
+remaining_school_cols = [col for col in ['assigned_middle', 'assigned_high'] if col in mini_X_pd.columns]
+if remaining_school_cols:
+    mini_X_pd = mini_X_pd.drop(columns=remaining_school_cols)
+
+for col in school_label_cols:
+    mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype(str)
+    mini_X_pd[f'{col}_score'] = mini_X_pd[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
+
+mini_X_pd = mini_X_pd[model_feature_cols]
+
 mini_nn_median = get_leakage_free_nn_median(
     X_train['lat'].to_numpy(),
     X_train['long'].to_numpy(),
     y_train_raw.to_numpy(),
-    mini_X['lat'].to_numpy(),
-    mini_X['long'].to_numpy(),
+    mini_X_pd['lat'].to_numpy(),
+    mini_X_pd['long'].to_numpy(),
     k=15,
 )[1]
-mini_X = mini_X.with_columns(pl.Series('nn_median_price', mini_nn_median))
-mini_X = mini_X.select(model_feature_cols)
+mini_X_pd['nn_median_price'] = mini_nn_median
 
-raw_pred_mini_lgbm = lgbm_model.predict(mini_X.to_numpy())
-raw_pred_mini_cat = catboost_model.predict(mini_X.to_numpy())
+mini_features = mini_X_pd[model_feature_cols]
+raw_pred_mini_lgbm = best_lgbm.predict(mini_features.to_numpy())
+raw_pred_mini_cat = best_catboost.predict(mini_features.to_numpy())
+raw_pred_mini_xgb = best_xgb.predict(mini_features.to_numpy())
+
 if use_log_target:
     pred_mini_lgbm = np.exp(raw_pred_mini_lgbm)
     pred_mini_cat = np.exp(raw_pred_mini_cat)
+    pred_mini_xgb = np.exp(raw_pred_mini_xgb)
 else:
     pred_mini_lgbm = raw_pred_mini_lgbm
     pred_mini_cat = raw_pred_mini_cat
-mini_preds = best_weight * pred_mini_cat + (1 - best_weight) * pred_mini_lgbm
+    pred_mini_xgb = raw_pred_mini_xgb
+
+mini_preds = (
+    best_3_weights[0] * pred_mini_lgbm
+    + best_3_weights[1] * pred_mini_cat
+    + best_3_weights[2] * pred_mini_xgb
+)
 
 output = pl.DataFrame(mini_preds, schema=['price'])
 output.write_csv('sanhedrin3-module3-predictions.csv')

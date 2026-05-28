@@ -1,6 +1,5 @@
 ```{python}
 import os
-import polars as pl
 import pandas as pd
 import numpy as np
 from pyproj import Transformer
@@ -38,38 +37,32 @@ use_log_target = True  # Set True to train on log(price) and inverse-transform p
 # 1. Load Data
 
 ```{python}
-housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
+housing = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
 ```
 
 # 2. Feature Engineering Helpers
 
 ```{python}
 def add_years_since_renovation(df):
-    return df.with_columns(
-        pl.when(pl.col('yr_renovated') == 0)
-        .then(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_built'))
-        .otherwise(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_renovated'))
-        .alias('years_since_renovation')
+    df = df.copy()
+    date_year = df['date'].astype(str).str.slice(0, 4).astype(int)
+    df['years_since_renovation'] = np.where(
+        df['yr_renovated'] == 0,
+        date_year - df['yr_built'],
+        date_year - df['yr_renovated'],
     )
+    return df
 
 
 def preprocess_housing(df):
-    df = df.drop('id')
-    df = add_years_since_renovation(df).drop('yr_renovated')
-    df = df.with_columns(
-        (pl.col('sqft_living') / pl.col('sqft_living15')).alias('sqft_living_to_neighbors')
-    )
-    df = df.drop('sqft_living')
-    df = df.drop('zipcode')
-    df = df.with_columns(
-        pl.when(pl.col('bedrooms') > 30)
-        .then(pl.col('bedrooms') // 10)
-        .otherwise(pl.col('bedrooms'))
-        .alias('bedrooms')
-    )
-    df = df.with_columns(
-        pl.col('date').str.slice(4, 2).cast(pl.Int32).alias('month')
-    ).drop('date')
+    df = df.copy()
+    df = df.drop(columns=['id'])
+    df = add_years_since_renovation(df).drop(columns=['yr_renovated'])
+    df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
+    df = df.drop(columns=['sqft_living', 'zipcode'])
+    df['bedrooms'] = np.where(df['bedrooms'] > 30, df['bedrooms'] // 10, df['bedrooms'])
+    df['month'] = df['date'].astype(str).str.slice(4, 6).astype(int)
+    df = df.drop(columns=['date'])
     return df
 
 
@@ -242,7 +235,8 @@ poi_groups = {
 poi_coords = {cat: coords for cat, coords in poi_groups.items() if len(coords) > 0}
 
 
-def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
+def build_spatial_features(dataset: pd.DataFrame) -> pd.DataFrame:
+    dataset = dataset.copy()
     house_lon = dataset['long'].to_numpy()
     house_lat = dataset['lat'].to_numpy()
 
@@ -274,12 +268,12 @@ def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
         return (dist <= radius).sum(axis=1)
 
     for category in category_groups:
-        features[f'min_dist_{category}'] = min_dist(category)
+        dataset[f'min_dist_{category}'] = min_dist(category)
         if category in radius_map:
             for radius in radius_map[category]:
-                features[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
+                dataset[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
 
-    return dataset.with_columns([pl.Series(name, values) for name, values in features.items()])
+    return dataset
 ```
 
 # 3. Prepare Training Data
@@ -289,33 +283,28 @@ housing = preprocess_housing(housing)
 
 if assign_school_boundaries_to_houses is not None:
     try:
-        housing = pl.from_pandas(assign_school_boundaries_to_houses(housing.to_pandas()))
-        school_label_cols = [
-            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
-            if col in housing.columns
-        ]
+        housing = assign_school_boundaries_to_houses(housing)
+        school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
         if len(school_label_cols) > 0:
-            housing_pd = housing.to_pandas()
             for col in school_label_cols:
-                housing_pd[col] = housing_pd[col].fillna('missing').astype(str)
-            housing = pl.from_pandas(housing_pd)
-        print('Assigned school boundaries: elementary, middle, and high school.')
+                housing[col] = housing[col].fillna('missing').astype(str)
+        print('Assigned elementary school boundaries for target encoding.')
     except Exception as e:
         print('Could not assign school boundaries:', e)
 
 housing = build_spatial_features(housing)
 
-school_label_cols = [
-    col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
-    if col in housing.columns
-]
+school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
+school_cols_to_remove = [col for col in ['assigned_middle', 'assigned_high'] if col in housing.columns]
+if school_cols_to_remove:
+    housing = housing.drop(columns=school_cols_to_remove)
 
 if use_log_target:
-    housing = housing.with_columns(pl.col('price').log().alias('log_price'))
-    X = housing.drop(['price', 'log_price'])
+    housing['log_price'] = np.log(housing['price'])
+    X = housing.drop(columns=['price', 'log_price'])
     y = housing['log_price']
 else:
-    X = housing.drop(['price'])
+    X = housing.drop(columns=['price'])
     y = housing['price']
 
 y_raw = housing['price']
@@ -351,13 +340,13 @@ train_nn_median, test_nn_median = get_leakage_free_nn_median(
     k=15,
 )
 
-X_train = X_train.with_columns(pl.Series('nn_median_price', train_nn_median))
-X_test = X_test.with_columns(pl.Series('nn_median_price', test_nn_median))
+X_train['nn_median_price'] = train_nn_median
+X_test['nn_median_price'] = test_nn_median
 
 model_feature_cols = list(X_train.columns)
 
-X_train_pd = X_train.to_pandas()
-X_test_pd = X_test.to_pandas()
+X_train_pd = X_train
+X_test_pd = X_test
 school_target_maps = {}
 overall_median_price = np.median(y_train_raw.to_numpy())
 for col in school_label_cols:
@@ -571,27 +560,24 @@ xgb_importance_df = pd.DataFrame({
 # 6. Holdout Prediction
 
 ```{python}
-mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
 mini_X = preprocess_housing(mini_X)
 
 if assign_school_boundaries_to_houses is not None:
     try:
-        mini_X = pl.from_pandas(assign_school_boundaries_to_houses(mini_X.to_pandas()))
+        mini_X = assign_school_boundaries_to_houses(mini_X)
         school_label_cols = [
-            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
+            col for col in ['assigned_elementary']
             if col in mini_X.columns
         ]
+        school_cols_to_remove = [col for col in ['assigned_middle', 'assigned_high'] if col in mini_X.columns]
+        if len(school_cols_to_remove) > 0:
+            mini_X = mini_X.drop(columns=school_cols_to_remove)
         if len(school_label_cols) > 0:
-            mini_X_pd = mini_X.to_pandas()
             for col in school_label_cols:
-                mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype(str)
-                mini_X_pd[f'{col}_score'] = mini_X_pd[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
-            cols_to_drop = [c for c in school_label_cols if c in mini_X_pd.columns]
-            if cols_to_drop:
-                mini_X = pl.from_pandas(mini_X_pd).drop(cols_to_drop)
-            else:
-                mini_X = pl.from_pandas(mini_X_pd)
-        print('Assigned school boundaries for holdout data.')
+                mini_X[col] = mini_X[col].fillna('missing').astype(str)
+                mini_X[f'{col}_score'] = mini_X[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
+        print('Assigned elementary school boundaries for holdout target encoding.')
     except Exception as e:
         print('Could not assign school boundaries for holdout data:', e)
 
@@ -604,8 +590,8 @@ mini_nn_median = get_leakage_free_nn_median(
     mini_X['long'].to_numpy(),
     k=15,
 )[1]
-mini_X = mini_X.with_columns(pl.Series('nn_median_price', mini_nn_median))
-mini_X = mini_X.select(model_feature_cols)
+mini_X['nn_median_price'] = mini_nn_median
+mini_X = mini_X[model_feature_cols]
 
 raw_pred_mini_xgb = xgb_model.predict(mini_X.to_numpy())
 if use_log_target:
@@ -613,7 +599,7 @@ if use_log_target:
 else:
     mini_preds = raw_pred_mini_xgb
 
-output = pl.DataFrame(mini_preds, schema=['price'])
-output.write_csv('sanhedrin3-module3-predictions.csv')
+output = pd.DataFrame({'price': mini_preds})
+output.to_csv('sanhedrin3-module3-predictions.csv', index=False)
 print('Holdout predictions saved to sanhedrin3-module3-predictions.csv')
 ```
