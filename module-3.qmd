@@ -1,0 +1,585 @@
+```{python}
+import polars as pl
+import numpy as np
+from lets_plot import *
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import root_mean_squared_error
+
+LetsPlot.setup_html()
+use_log_target = False  # Set True to train on log(price) and inverse-transform predictions
+```
+
+
+```{python}
+housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
+```
+
+
+Drop the id Column
+
+```{python}
+housing = housing.drop('id')
+```
+
+
+Multicollinearity (Redundant Data): Notice that sqft_living is simply the sum of sqft_above and sqft_basement. If you include all three, you have perfect collinearity. Depending on your algorithm, this can cause mathematical instability or skew feature importance. You should usually drop either sqft_living or both of the sub-components.
+
+
+```{python}
+housing = housing.drop('sqft_living')
+```
+
+
+
+The yr_renovated Trap: In housing datasets, houses that have never been renovated usually have a 0 in this column. If you leave it as 0, the model will think the house was renovated 2,000 years ago. You should create a new feature like years_since_renovation (using the date of sale minus yr_renovated), and for houses that were never renovated, fall back to calculating it based on yr_built.
+
+You combine two signals into one: Instead of the tree having to look at yr_built to judge the age of a normal house, and then suddenly look at yr_renovated to judge the age of an updated house, you hand it a single, clean column that answers the real question: "How old is the current interior of this house?"
+
+```{python}
+years_since_renovation = pl.when(pl.col('yr_renovated') == 0).then(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_built')).otherwise(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_renovated')).alias('years_since_renovation')
+housing = housing.with_columns(years_since_renovation).drop('yr_renovated')
+```
+
+
+
+
+zipcode is Categorical: Even though zip codes are numbers, they have no mathematical relationship (a zip code of 90002 isn't "twice as much" as 45001). Ensure your model treats this as a categorical string or one-hot encodes it, rather than treating it as a continuous integer.
+
+Instead of using the zip code itself, you replace the zip code with the median house price of that specific zip code in your training data.
+
+
+```{python}
+zip_code_median_price = housing.group_by('zipcode').agg(pl.col('price').median().alias('median_price_by_zipcode'))
+housing = housing.join(zip_code_median_price, on='zipcode').drop('zipcode')
+```
+
+
+
+1. The Right-Skewed Target Variable (price)
+In real estate, prices are almost always extremely right-skewed. You will have a massive cluster of homes in the $300k–$700k range, and a long tail of multi-million dollar mansions.
+
+The Problem: Models like Random Forest and XGBoost minimize average errors (like MSE). If you train them on raw prices, they will disproportionately optimize for the multi-million dollar mansions because being off by 10% on a $5M house creates a much larger absolute error than being off by 10% on a $300k house.
+
+The Fix: Apply a log transformation to the price column before training, predict the log-price, and then exponentiate your predictions to get back to dollars. This forces the model to care more about percentage errors across the board.
+
+```{python}
+if use_log_target:
+    housing = housing.with_columns(pl.col('price').log().alias('log_price'))
+```
+
+2. The "Neighbor" Columns (sqft_living15, sqft_lot15)
+These columns represent the average square footage of the nearest 15 neighbors. This is actually a fantastic, pre-engineered spatial feature, but it introduces an opportunity.
+
+Feature Engineering: In real estate, the "biggest house on the block" usually suffers a penalty in price-per-square-foot compared to its neighbors. You can create a powerful new feature by calculating a ratio: sqft_living / sqft_living15. If the value is > 1.0, the house is larger than its neighbors; if < 1.0, it is smaller. Models often find high predictive value in this specific ratio.
+
+3. Sneaky Data Entry Errors & Outliers
+Datasets based on this specific dictionary (often the King County housing dataset) are notorious for containing a few wild data entry errors.
+
+Bedrooms: Keep an eye out for extreme outliers, like a house with 33 bedrooms and only 1.75 bathrooms. If you leave obvious typos in the dataset, your model will try to learn from them.
+
+If bedrooms are higher than 30 drop the second digit
+
+```{python}
+housing = housing.with_columns(pl.when(pl.col('bedrooms') > 30).then(pl.col('bedrooms') // 10).otherwise(pl.col('bedrooms')).alias('bedrooms'))
+```
+
+
+Seasonality: Extract the month from the date. Housing markets are highly seasonal (homes often sell for more and faster in the spring/summer than in the winter).
+
+```{python}
+housing = housing.with_columns(pl.col('date').str.slice(4, 2).cast(pl.Int32).alias('month')).drop('date')
+```
+
+# Train-Test Split
+
+```{python}
+if use_log_target:
+    housing = housing.with_columns(pl.col('price').log().alias('log_price'))
+    X = housing.drop(['price', 'log_price'])
+    y = housing['log_price']
+else:
+    X = housing.drop(['price'])
+    y = housing['price']
+y_raw = housing['price']
+
+X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
+    X, y, y_raw, test_size=0.2, random_state=42
+)
+
+model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+model.fit(X_train, y_train)
+
+pred_raw = model.predict(X_test)
+if use_log_target:
+    y_pred = np.exp(pred_raw)
+else:
+    y_pred = pred_raw
+rmse = root_mean_squared_error(y_test_raw.to_numpy(), y_pred)
+print(f'Root Mean Squared Error: {rmse}')
+```
+
+
+plot our predictions vs actuals
+
+
+```{python}
+actuals_vs_predictions = pl.DataFrame({
+    'Actual Price': y_test_raw,
+    'Predicted Price': y_pred
+})
+
+plot = ggplot(actuals_vs_predictions, aes(x='Actual Price', y='Predicted Price')) + geom_point() + geom_abline(slope=1, intercept=0) + labs(title='Actual vs Predicted Prices', x='Actual Price', y='Predicted Price')
+plot
+```
+
+
+evaluate feature importance
+
+```{python}
+importances = model.feature_importances_
+feature_names = X.columns
+
+importance_df = pl.DataFrame({
+    "Feature": feature_names,
+    "Importance": importances
+}).sort("Importance", descending=True)
+
+
+(ggplot(importance_df.head(15), aes(x="Importance", y=as_discrete("Feature", order_by="Importance"), fill="Importance"))
+ + geom_bar(stat='identity')
+ + scale_fill_gradient(low="#d1e5f0", high="#053061")
+ + ggtitle("Top 15 Most Important Features")
+ + theme_minimal2()
+)
+```
+
+
+
+```{python}
+# scores = cross_val_score(model, X, y, scoring='neg_root_mean_squared_error', cv=5)
+# print('CV RMSE:', -scores.mean())
+```
+
+
+
+```{python}
+residuals = y_test_raw - y_pred
+residual_df = pl.DataFrame({'Predicted Price': y_pred, 'Residual': residuals})
+
+ggplot(residual_df, aes(x='Predicted Price', y='Residual')) + geom_point() + geom_hline(yintercept=0, color='red')
+```
+
+
+
+
+
+
+Mini Holdout
+```{python}
+mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+
+housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
+
+print(mini_X.columns)
+
+mini_X = mini_X.drop('id')
+
+years_since_renovation = pl.when(pl.col('yr_renovated') == 0).then(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_built')).otherwise(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_renovated')).alias('years_since_renovation')
+mini_X = mini_X.with_columns(years_since_renovation).drop('yr_renovated')
+
+mini_X = mini_X.drop('sqft_living')
+
+zip_code_median_price = housing.group_by('zipcode').agg(
+    pl.col('price').median().alias('median_price_by_zipcode')
+)
+
+overall_median_price = housing.select(
+    pl.col('price').median().alias('overall_median_price')
+).to_series()[0]
+
+mini_X = mini_X.join(zip_code_median_price, on='zipcode', how='left')
+
+mini_X = mini_X.with_columns(
+    pl.col('median_price_by_zipcode').fill_null(overall_median_price)
+).drop('zipcode')
+
+
+mini_X = mini_X.with_columns(pl.when(pl.col('bedrooms') > 30).then(pl.col('bedrooms') // 10).otherwise(pl.col('bedrooms')).alias('bedrooms'))
+
+
+mini_X = mini_X.with_columns(pl.col('date').str.slice(4, 2).cast(pl.Int32).alias('month')).drop('date')
+
+print(X.columns)
+print(mini_X.columns)
+
+
+mini_preds_raw = model.predict(mini_X)
+mini_preds = np.exp(mini_preds_raw) if use_log_target else mini_preds_raw
+
+my_predictions = pl.DataFrame(mini_preds, schema=['price'])
+my_predictions.write_csv("sanhedrin3-module3-predictions.csv")
+
+```
+
+
+
+
+
+
+
+Comparison of tree models and ensemble mixes
+```{python}
+import time
+import numpy as np
+from sklearn.metrics import r2_score
+try:
+    from xgboost import XGBRegressor
+except ImportError:
+    raise ImportError("Install xgboost to run the model comparison.")
+try:
+    from lightgbm import LGBMRegressor
+except ImportError:
+    raise ImportError("Install lightgbm to run the model comparison.")
+try:
+    from catboost import CatBoostRegressor
+except ImportError:
+    raise ImportError("Install catboost to run the model comparison.")
+
+start_time = time.perf_counter()
+
+X_train_np = X_train.to_numpy()
+y_train_np = y_train.to_numpy()
+X_test_np = X_test.to_numpy()
+y_test_np = y_test.to_numpy()
+y_train_raw_np = y_train_raw.to_numpy()
+y_test_raw_np = y_test_raw.to_numpy()
+
+seeds = [0, 1, 2, 3, 4]
+
+rf_grid = [
+    {'n_estimators': n, 'max_depth': d}
+    for n in range(50, 251, 50)
+    for d in range(5, 16)
+]
+
+xgb_grid = [
+    {'n_estimators': n, 'max_depth': d, 'learning_rate': lr}
+    for n in range(100, 301, 25)
+    for d in range(3, 8)
+    for lr in [0.03, 0.05, 0.1]
+]
+
+lgbm_grid = [
+    {'n_estimators': n, 'max_depth': d, 'learning_rate': lr}
+    for n in range(100, 251, 25)
+    for d in [3, 5, 7, 9]
+    for lr in [0.03, 0.05, 0.1]
+]
+
+catboost_grid = [
+    {'iterations': n, 'depth': d, 'learning_rate': lr}
+    for n in range(100, 251, 25)
+    for d in [3, 5, 7, 9]
+    for lr in [0.03, 0.05, 0.1]
+]
+
+best_rf = None
+best_rf_rmse = float('inf')
+rf_results = []
+for params in rf_grid:
+    rmse_scores = []
+    r2_scores = []
+    for seed in seeds:
+        model_rf = RandomForestRegressor(**params, n_jobs=-1, random_state=seed)
+        model_rf.fit(X_train_np, y_train_np)
+        pred_raw = model_rf.predict(X_test_np)
+        pred = np.exp(pred_raw) if use_log_target else pred_raw
+        rmse_scores.append(root_mean_squared_error(y_test_raw_np, pred))
+        r2_scores.append(r2_score(y_test_raw_np, pred))
+    avg_rmse = np.mean(rmse_scores)
+    avg_r2 = np.mean(r2_scores)
+    rf_results.append({'model': 'Random Forest', 'params': params, 'rmse': avg_rmse, 'r2': avg_r2})
+    if avg_rmse < best_rf_rmse:
+        best_rf_rmse = avg_rmse
+        best_rf = params
+
+best_cat = None
+best_cat_rmse = float('inf')
+cat_results = []
+for params in catboost_grid:
+    rmse_scores = []
+    r2_scores = []
+    for seed in seeds:
+        model_cat = CatBoostRegressor(**params, thread_count=-1, random_seed=seed)
+        model_cat.fit(X_train_np, y_train_np)
+        pred_raw = model_cat.predict(X_test_np)
+        pred = np.exp(pred_raw) if use_log_target else pred_raw
+        rmse_scores.append(root_mean_squared_error(y_test_raw_np, pred))
+        r2_scores.append(r2_score(y_test_raw_np, pred))
+    avg_rmse = np.mean(rmse_scores)
+    avg_r2 = np.mean(r2_scores)
+    cat_results.append({'model': 'CatBoost', 'params': params, 'rmse': avg_rmse, 'r2': avg_r2})
+    if avg_rmse < best_cat_rmse:
+        best_cat_rmse = avg_rmse
+        best_cat = params
+
+best_xgb = None
+best_xgb_rmse = float('inf')
+xgb_results = []
+for params in xgb_grid:
+    rmse_scores = []
+    r2_scores = []
+    for seed in seeds:
+        model_xgb = XGBRegressor(**params, objective='reg:squarederror', verbosity=0, n_jobs=-1, random_state=seed)
+        model_xgb.fit(X_train_np, y_train_np)
+        pred_raw = model_xgb.predict(X_test_np)
+        pred = np.exp(pred_raw) if use_log_target else pred_raw
+        rmse_scores.append(root_mean_squared_error(y_test_raw_np, pred))
+        r2_scores.append(r2_score(y_test_raw_np, pred))
+    avg_rmse = np.mean(rmse_scores)
+    avg_r2 = np.mean(r2_scores)
+    xgb_results.append({'model': 'XGBoost', 'params': params, 'rmse': avg_rmse, 'r2': avg_r2})
+    if avg_rmse < best_xgb_rmse:
+        best_xgb_rmse = avg_rmse
+        best_xgb = params
+
+best_lgbm = None
+best_lgbm_rmse = float('inf')
+lgbm_results = []
+for params in lgbm_grid:
+    rmse_scores = []
+    r2_scores = []
+    for seed in seeds:
+        model_lgbm = LGBMRegressor(**params, n_jobs=-1, random_state=seed, verbose=-1)
+        model_lgbm.fit(X_train_np, y_train_np)
+        pred_raw = model_lgbm.predict(X_test_np)
+        pred = np.exp(pred_raw) if use_log_target else pred_raw
+        rmse_scores.append(root_mean_squared_error(y_test_raw_np, pred))
+        r2_scores.append(r2_score(y_test_raw_np, pred))
+    avg_rmse = np.mean(rmse_scores)
+    avg_r2 = np.mean(r2_scores)
+    lgbm_results.append({'model': 'LightGBM', 'params': params, 'rmse': avg_rmse, 'r2': avg_r2})
+    if avg_rmse < best_lgbm_rmse:
+        best_lgbm_rmse = avg_rmse
+        best_lgbm = params
+
+print('\nBest RF params:', best_rf)
+print('Best RF RMSE on test:', best_rf_rmse)
+print('\nBest XGB params:', best_xgb)
+print('Best XGB RMSE on test:', best_xgb_rmse)
+print('\nBest LightGBM params:', best_lgbm)
+print('Best LightGBM RMSE on test:', best_lgbm_rmse)
+print('\nBest CatBoost params:', best_cat)
+print('Best CatBoost RMSE on test:', best_cat_rmse)
+
+best_rf_model = RandomForestRegressor(**best_rf)
+best_rf_model.fit(X_train_np, y_train_np)
+rf_test_pred_raw = best_rf_model.predict(X_test_np)
+rf_test_pred = np.exp(rf_test_pred_raw) if use_log_target else rf_test_pred_raw
+
+best_xgb_model = XGBRegressor(**best_xgb, objective='reg:squarederror', verbosity=0)
+best_xgb_model.fit(X_train_np, y_train_np)
+xgb_test_pred_raw = best_xgb_model.predict(X_test_np)
+xgb_test_pred = np.exp(xgb_test_pred_raw) if use_log_target else xgb_test_pred_raw
+
+best_lgbm_model = LGBMRegressor(**best_lgbm)
+best_lgbm_model.fit(X_train_np, y_train_np)
+lgbm_test_pred_raw = best_lgbm_model.predict(X_test_np)
+lgbm_test_pred = np.exp(lgbm_test_pred_raw) if use_log_target else lgbm_test_pred_raw
+
+best_cat_model = CatBoostRegressor(**best_cat, thread_count=-1, random_seed=0)
+best_cat_model.fit(X_train_np, y_train_np)
+cat_test_pred_raw = best_cat_model.predict(X_test_np)
+cat_test_pred = np.exp(cat_test_pred_raw) if use_log_target else cat_test_pred_raw
+
+rf_test_rmse = root_mean_squared_error(y_test_raw_np, rf_test_pred)
+rf_test_r2 = r2_score(y_test_raw_np, rf_test_pred)
+xgb_test_rmse = root_mean_squared_error(y_test_raw_np, xgb_test_pred)
+xgb_test_r2 = r2_score(y_test_raw_np, xgb_test_pred)
+lgbm_test_rmse = root_mean_squared_error(y_test_raw_np, lgbm_test_pred)
+lgbm_test_r2 = r2_score(y_test_raw_np, lgbm_test_pred)
+cat_test_rmse = root_mean_squared_error(y_test_raw_np, cat_test_pred)
+cat_test_r2 = r2_score(y_test_raw_np, cat_test_pred)
+
+print('\nRF test RMSE:', rf_test_rmse)
+print('RF test R2:', rf_test_r2)
+print('XGB test RMSE:', xgb_test_rmse)
+print('XGB test R2:', xgb_test_r2)
+print('LightGBM test RMSE:', lgbm_test_rmse)
+print('LightGBM test R2:', lgbm_test_r2)
+print('CatBoost test RMSE:', cat_test_rmse)
+print('CatBoost test R2:', cat_test_r2)
+
+pairwise_results = []
+for name, pred_a, pred_b in [
+    ('RF+XGB', rf_test_pred, xgb_test_pred),
+    ('RF+LightGBM', rf_test_pred, lgbm_test_pred),
+    ('RF+CatBoost', rf_test_pred, cat_test_pred),
+    ('XGB+LightGBM', xgb_test_pred, lgbm_test_pred),
+    ('XGB+CatBoost', xgb_test_pred, cat_test_pred),
+    ('LightGBM+CatBoost', lgbm_test_pred, cat_test_pred)
+]:
+    ensemble_pred = 0.5 * pred_a + 0.5 * pred_b
+    rmse = root_mean_squared_error(y_test_raw_np, ensemble_pred)
+    r2 = r2_score(y_test_raw_np, ensemble_pred)
+    pairwise_results.append({'ensemble': name, 'rmse': rmse, 'r2': r2})
+    print(f'{name}: RMSE={rmse:.2f}, R2={r2:.3f}')
+
+all_four_pred = (rf_test_pred + xgb_test_pred + lgbm_test_pred + cat_test_pred) / 4
+all_four_rmse = root_mean_squared_error(y_test_raw_np, all_four_pred)
+all_four_r2 = r2_score(y_test_raw_np, all_four_pred)
+print(f'All 4 average: RMSE={all_four_rmse:.2f}, R2={all_four_r2:.3f}')
+
+comparison_df = pl.DataFrame({
+    'Model': ['Random Forest', 'XGBoost', 'LightGBM', 'CatBoost', 'RF+XGB', 'RF+LightGBM', 'RF+CatBoost', 'XGB+LightGBM', 'XGB+CatBoost', 'LightGBM+CatBoost', 'All 4 average'],
+    'RMSE': [rf_test_rmse, xgb_test_rmse, lgbm_test_rmse, cat_test_rmse] + [r['rmse'] for r in pairwise_results] + [all_four_rmse],
+    'R2': [rf_test_r2, xgb_test_r2, lgbm_test_r2, cat_test_r2] + [r['r2'] for r in pairwise_results] + [all_four_r2]
+})
+print('\nFinal comparison:')
+print(comparison_df)
+
+end_time = time.perf_counter()
+print(f'Comparison block elapsed time: {end_time - start_time:.2f} seconds')
+
+rf_summary = pl.DataFrame(rf_results).select(['params', 'rmse', 'r2'])
+xgb_summary = pl.DataFrame(xgb_results).select(['params', 'rmse', 'r2'])
+lgbm_summary = pl.DataFrame(lgbm_results).select(['params', 'rmse', 'r2'])
+cat_summary = pl.DataFrame(cat_results).select(['params', 'rmse', 'r2'])
+ensemble_summary = pl.DataFrame(pairwise_results).rename({'ensemble': 'params'})
+
+print('\nRF candidate scores:')
+print(rf_summary)
+print('\nXGB candidate scores:')
+print(xgb_summary)
+print('\nLightGBM candidate scores:')
+print(lgbm_summary)
+print('\nCatBoost candidate scores:')
+print(cat_summary)
+print('\nEnsemble candidate scores (pairwise):')
+print(ensemble_summary)
+
+```
+
+```{python}
+print('\nBest base model parameters and scores:')
+for model_name, model_params, model_rmse, model_r2 in [
+    ('Random Forest', best_rf, rf_test_rmse, rf_test_r2),
+    ('XGBoost', best_xgb, xgb_test_rmse, xgb_test_r2),
+    ('LightGBM', best_lgbm, lgbm_test_rmse, lgbm_test_r2),
+    ('CatBoost', best_cat, cat_test_rmse, cat_test_r2),
+]:
+    print(f"{model_name}: params={model_params}, RMSE={model_rmse:.2f}, R2={model_r2:.3f}")
+
+pairwise_df = pl.DataFrame(pairwise_results)
+best_pairwise = pairwise_df.sort('rmse').select(['ensemble', 'rmse', 'r2']).to_dicts()[0]
+print(f"\nBest pairwise ensemble: {best_pairwise['ensemble']} RMSE={best_pairwise['rmse']:.2f}, R2={best_pairwise['r2']:.3f}")
+
+mix_weights = np.linspace(0, 1, 11)
+lgbm_cat_mix_results = []
+for w in mix_weights:
+    mix_pred = w * cat_test_pred + (1 - w) * lgbm_test_pred
+    lgbm_cat_mix_results.append({
+        'CatBoost_weight': float(w),
+        'LightGBM_weight': float(1 - w),
+        'RMSE': root_mean_squared_error(y_test_raw_np, mix_pred),
+        'R2': r2_score(y_test_raw_np, mix_pred)
+    })
+mix_df = pl.DataFrame(lgbm_cat_mix_results)
+best_mix = mix_df.sort('RMSE').select(['CatBoost_weight', 'LightGBM_weight', 'RMSE', 'R2']).to_dicts()[0]
+print(f"\nBest LightGBM+CatBoost blend: CatBoost weight={best_mix['CatBoost_weight']:.2f}, LightGBM weight={best_mix['LightGBM_weight']:.2f}, RMSE={best_mix['RMSE']:.2f}, R2={best_mix['R2']:.3f}")
+
+plot = (
+    ggplot(mix_df, aes(x='CatBoost_weight', y='RMSE'))
+    + geom_line(size=1.5)
+    + geom_point(size=3)
+    + labs(
+        title='LightGBM + CatBoost blend RMSE across mixing weights',
+        x='CatBoost weight',
+        y='RMSE'
+    )
+)
+plot
+```
+
+
+
+R² by n_estimators and max_depth
+```{python}
+rf_plot_df = pl.DataFrame({
+    'Model': ['Random Forest'] * len(rf_results),
+    'n_estimators': [r['params']['n_estimators'] for r in rf_results],
+    'max_depth': [r['params']['max_depth'] for r in rf_results],
+    'RMSE': [r['rmse'] for r in rf_results]
+})
+
+xgb_plot_df = pl.DataFrame({
+    'Model': ['XGBoost'] * len(xgb_results),
+    'n_estimators': [r['params']['n_estimators'] for r in xgb_results],
+    'max_depth': [r['params']['max_depth'] for r in xgb_results],
+    'RMSE': [r['rmse'] for r in xgb_results]
+})
+
+lgbm_plot_df = pl.DataFrame({
+    'Model': ['LightGBM'] * len(lgbm_results),
+    'n_estimators': [r['params']['n_estimators'] for r in lgbm_results],
+    'max_depth': [r['params']['max_depth'] for r in lgbm_results],
+    'RMSE': [r['rmse'] for r in lgbm_results]
+})
+
+cat_plot_df = pl.DataFrame({
+    'Model': ['CatBoost'] * len(cat_results),
+    'n_estimators': [r['params']['iterations'] for r in cat_results],
+    'max_depth': [r['params']['depth'] for r in cat_results],
+    'RMSE': [r['rmse'] for r in cat_results]
+})
+
+plot_df = pl.concat([rf_plot_df, xgb_plot_df, lgbm_plot_df, cat_plot_df])
+
+plot = (
+    ggplot(plot_df, aes(x='max_depth', y='n_estimators', color='RMSE'))
+    + geom_point(size=3)
+    + facet_wrap('Model')
+    + labs(
+        title='RMSE by max_depth and n_estimators for all base models',
+        x='max_depth',
+        y='n_estimators',
+        color='RMSE'
+    )
+)
+plot
+```
+
+Ensemble RMSE by model pair
+```{python}
+ensemble_plot_df = pl.DataFrame({
+    'Model': [r['ensemble'] for r in pairwise_results] + ['All 4 average'],
+    'RMSE': [r['rmse'] for r in pairwise_results] + [all_four_rmse]
+})
+
+plot = (
+    ggplot(ensemble_plot_df, aes(x='Model', y='RMSE', fill='Model'))
+    + geom_bar(stat='identity')
+    + labs(
+        title='Ensemble RMSE by model combination',
+        x='Ensemble',
+        y='RMSE'
+    )
+)
+plot
+```
+
+
+
+Find distance to downtown or schools or other things so we get better data on why these houses are valuable. 
+
+
+look into the data set
+
+
+zipcode vs lat and long median price  cause zipcode might be too generalized
+
+
+how do we quantify the value of good predictions?
+
+maybe a base model vs ours?

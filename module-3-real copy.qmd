@@ -1,0 +1,556 @@
+```{python}
+import os
+import polars as pl
+import pandas as pd
+import numpy as np
+from pyproj import Transformer
+from lets_plot import *
+from sklearn.model_selection import train_test_split, ParameterSampler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import root_mean_squared_error, r2_score
+import xgboost as xgb
+from xgboost import XGBRegressor
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+
+transformer = Transformer.from_crs('EPSG:2285', 'EPSG:4326', always_xy=True)
+
+SCHOOL_SHAPEFILE_ROOT = os.path.join('SABS_1516_SchoolLevels', 'SABS_1516_SchoolLevels')
+SCHOOL_LAYERS = {
+    'elementary': 'SABS_1516_Primary.shp',
+    'middle': 'SABS_1516_Middle.shp',
+    'high': 'SABS_1516_High.shp',
+}
+
+CONVERTED_DATA = 'converted_data.csv'
+RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
+
+LetsPlot.setup_html()
+use_log_target = True  # Set True to train on log(price) and inverse-transform predictions
+```
+
+# 1. Load Data
+
+```{python}
+housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
+```
+
+# 2. Feature Engineering Helpers
+
+```{python}
+def add_years_since_renovation(df):
+    return df.with_columns(
+        pl.when(pl.col('yr_renovated') == 0)
+        .then(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_built'))
+        .otherwise(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_renovated'))
+        .alias('years_since_renovation')
+    )
+
+
+def preprocess_housing(df):
+    df = df.drop('id')
+    df = add_years_since_renovation(df).drop('yr_renovated')
+    df = df.with_columns(
+        (pl.col('sqft_living') / pl.col('sqft_living15')).alias('sqft_living_to_neighbors')
+    )
+    df = df.drop('sqft_living')
+    df = df.drop('zipcode')
+    df = df.with_columns(
+        pl.when(pl.col('bedrooms') > 30)
+        .then(pl.col('bedrooms') // 10)
+        .otherwise(pl.col('bedrooms'))
+        .alias('bedrooms')
+    )
+    df = df.with_columns(
+        pl.col('date').str.slice(4, 2).cast(pl.Int32).alias('month')
+    ).drop('date')
+    return df
+
+
+def convert_to_latlon(row):
+    try:
+        lon, lat = transformer.transform(row['x'], row['y'])
+        return pd.Series({'Longitude': lon, 'Latitude': lat})
+    except Exception:
+        return pd.Series({'Longitude': None, 'Latitude': None})
+
+
+def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
+    if os.path.exists(path):
+        return pd.read_csv(path)
+
+    df = pd.read_csv(source)
+    df[['Longitude', 'Latitude']] = df.apply(convert_to_latlon, axis=1)
+    df.to_csv(path, index=False)
+    return df
+
+
+def _get_name_column(gdf):
+    for candidate in ['schnam', 'schoolname', 'name', 'schnm']:
+        if candidate in gdf.columns:
+            return candidate
+    return None
+
+
+def _read_school_layer(path):
+    if not GEOPANDAS_AVAILABLE:
+        raise ImportError('geopandas is required for school boundary joins')
+    layer = gpd.read_file(path)
+    if layer.crs is None:
+        raise ValueError(f'CRS missing on {path}')
+    return layer
+
+
+def assign_school_boundaries_to_houses(houses_df):
+    if not GEOPANDAS_AVAILABLE:
+        raise ImportError('geopandas is required for school boundary joins')
+
+    houses = houses_df.copy()
+    for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']:
+        if col in houses.columns:
+            houses = houses.drop(columns=[col])
+
+    if 'Longitude' not in houses.columns or 'Latitude' not in houses.columns:
+        if 'long' in houses.columns and 'lat' in houses.columns:
+            houses['Longitude'] = houses['long']
+            houses['Latitude'] = houses['lat']
+        else:
+            raise ValueError('House dataframe must contain long/lat or Longitude/Latitude columns')
+
+    houses_gdf = gpd.GeoDataFrame(
+        houses,
+        geometry=gpd.points_from_xy(houses['Longitude'], houses['Latitude']),
+        crs='EPSG:4326',
+    )
+
+    for level, shapefile in SCHOOL_LAYERS.items():
+        path = os.path.join(SCHOOL_SHAPEFILE_ROOT, shapefile)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'Shapefile not found: {path}')
+
+        layer = _read_school_layer(path)
+        if layer.crs != houses_gdf.crs:
+            layer = layer.to_crs(houses_gdf.crs)
+
+        name_col = _get_name_column(layer)
+        if name_col is None:
+            raise ValueError(f'No school name column found in {path}')
+
+        layer = layer[[name_col, 'geometry']].rename(columns={name_col: f'assigned_{level}'})
+        joined = gpd.sjoin(houses_gdf, layer, how='left', predicate='within')
+        if f'assigned_{level}' not in joined.columns:
+            raise ValueError(f'Expected assigned column missing after join for level {level}')
+
+        joined = joined.reset_index().rename(columns={'index': 'house_index'})
+        assigned_series = joined.groupby('house_index')[f'assigned_{level}'].first()
+        houses_gdf[f'assigned_{level}'] = houses_gdf.index.to_series().map(assigned_series)
+
+    result = houses_gdf.drop(columns=['geometry'])
+    for temp_col in ['Longitude', 'Latitude']:
+        if temp_col in result.columns:
+            result = result.drop(columns=[temp_col])
+    return pd.DataFrame(result)
+```
+
+# 2b. Spatial POI Feature Engineering
+
+```{python}
+def haversine_distance(lon1, lat1, lon2, lat2):
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return 3958.8 * c
+
+poi = ensure_converted_poi()
+poi['CODE'] = poi['CODE'].astype(int)
+
+category_map = {
+    90: 'neighborhood_center',
+    240: 'entertainment',
+    270: 'entertainment',
+    300: 'golf',
+    330: 'healthcare',
+    340: 'healthcare',
+    390: 'library',
+    420: 'employer',
+    480: 'entertainment',
+    500: 'transit',
+    510: 'transit',
+    600: 'park',
+    660: 'elementary_school',
+    661: 'middle_school',
+    662: 'high_school',
+    664: 'community_school',
+    666: 'private_school',
+    690: 'mall',
+    695: 'grocery',
+    800: 'church',
+}
+poi['category'] = poi['CODE'].map(category_map).fillna('other')
+
+category_groups = {
+    'neighborhood_center': [90],
+    'entertainment': [240, 270, 480],
+    'golf': [300],
+    'healthcare': [330, 340],
+    'library': [390],
+    'employer': [420],
+    'transit': [500, 510],
+    'park': [600],
+    'elementary_school': [660],
+    'middle_school': [661],
+    'high_school': [662],
+    'community_school': [664],
+    'private_school': [666],
+    'mall': [690],
+    'grocery': [695],
+    'church': [800],
+}
+
+radius_map = {
+    'park': [0.5, 1.0, 2.0],
+    'grocery': [0.5, 1.0],
+    'transit': [0.5, 1.0],
+    'elementary_school': [0.5, 1.0],
+    'middle_school': [1.0, 1.5],
+    'high_school': [1.0, 1.5],
+    'community_school': [1.0, 1.5],
+    'private_school': [1.0, 1.5],
+    'library': [1.0, 1.5],
+    'church': [1.0, 1.5],
+    'mall': [3.0, 5.0],
+    'healthcare': [3.0, 5.0],
+    'golf': [5.0],
+    'entertainment': [3.0, 5.0],
+    'employer': [3.0, 5.0],
+    'neighborhood_center': [1.0, 3.0],
+}
+
+poi_groups = {
+    cat: poi.loc[poi['category'] == cat, ['Longitude', 'Latitude']].to_numpy()
+    for cat in category_groups
+}
+
+poi_coords = {cat: coords for cat, coords in poi_groups.items() if len(coords) > 0}
+
+
+def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
+    house_lon = dataset['long'].to_numpy()
+    house_lat = dataset['lat'].to_numpy()
+
+    features = {
+        'distance_to_downtown': haversine_distance(
+            house_lon,
+            house_lat,
+            np.full_like(house_lon, -122.3321),
+            np.full_like(house_lat, 47.6062),
+        )
+    }
+
+    def min_dist(category):
+        coords = poi_coords.get(category)
+        if coords is None or len(coords) == 0:
+            return np.full(len(house_lon), np.nan)
+        lon2 = coords[:, 0][None, :]
+        lat2 = coords[:, 1][None, :]
+        dist = haversine_distance(house_lon[:, None], house_lat[:, None], lon2, lat2)
+        return dist.min(axis=1)
+
+    def count_within(category, radius):
+        coords = poi_coords.get(category)
+        if coords is None or len(coords) == 0:
+            return np.zeros(len(house_lon), dtype=int)
+        lon2 = coords[:, 0][None, :]
+        lat2 = coords[:, 1][None, :]
+        dist = haversine_distance(house_lon[:, None], house_lat[:, None], lon2, lat2)
+        return (dist <= radius).sum(axis=1)
+
+    for category in category_groups:
+        features[f'min_dist_{category}'] = min_dist(category)
+        if category in radius_map:
+            for radius in radius_map[category]:
+                features[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
+
+    return dataset.with_columns([pl.Series(name, values) for name, values in features.items()])
+```
+
+# 3. Prepare Training Data
+
+```{python}
+housing = preprocess_housing(housing)
+
+if assign_school_boundaries_to_houses is not None:
+    try:
+        housing = pl.from_pandas(assign_school_boundaries_to_houses(housing.to_pandas()))
+        school_label_cols = [
+            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
+            if col in housing.columns
+        ]
+        if len(school_label_cols) > 0:
+            housing_pd = housing.to_pandas()
+            for col in school_label_cols:
+                housing_pd[col] = housing_pd[col].fillna('missing').astype('category')
+                housing_pd[f'{col}_code'] = housing_pd[col].cat.codes
+            housing = pl.from_pandas(housing_pd)
+        print('Assigned school boundaries: elementary, middle, and high school.')
+    except Exception as e:
+        print('Could not assign school boundaries:', e)
+
+housing = build_spatial_features(housing)
+
+school_label_cols = [
+    col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
+    if col in housing.columns
+]
+
+if use_log_target:
+    housing = housing.with_columns(pl.col('price').log().alias('log_price'))
+    X = housing.drop(['price', 'log_price'] + school_label_cols)
+    y = housing['log_price']
+else:
+    X = housing.drop(['price'] + school_label_cols)
+    y = housing['price']
+
+y_raw = housing['price']
+
+X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
+    X, y, y_raw, test_size=0.2, random_state=42
+)
+
+# 3b. Leakage-free KNN median price feature
+
+def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=15):
+    train_coords = np.radians(np.column_stack((train_lat, train_lon)))
+    test_coords = np.radians(np.column_stack((test_lat, test_lon)))
+
+    nn = NearestNeighbors(n_neighbors=k + 1, metric='haversine')
+    nn.fit(train_coords)
+
+    _, train_indices = nn.kneighbors(train_coords, n_neighbors=k + 1)
+    train_indices_no_self = train_indices[:, 1:]
+    train_nn_median = np.median(train_price[train_indices_no_self], axis=1)
+
+    _, test_indices = nn.kneighbors(test_coords, n_neighbors=k)
+    test_nn_median = np.median(train_price[test_indices], axis=1)
+
+    return train_nn_median, test_nn_median
+
+train_nn_median, test_nn_median = get_leakage_free_nn_median(
+    X_train['lat'].to_numpy(),
+    X_train['long'].to_numpy(),
+    y_train_raw.to_numpy(),
+    X_test['lat'].to_numpy(),
+    X_test['long'].to_numpy(),
+    k=15,
+)
+
+X_train = X_train.with_columns(pl.Series('nn_median_price', train_nn_median))
+X_test = X_test.with_columns(pl.Series('nn_median_price', test_nn_median))
+
+model_feature_cols = list(X_train.columns)
+
+# 3c. XGBoost CV-based hyperparameter tuning
+
+def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_rounds=20, random_state=42):
+    dtrain = xgb.DMatrix(X.to_numpy(), label=y.to_numpy())
+    param_list = list(ParameterSampler(param_grid, n_iter=n_iter, random_state=random_state))
+    best_score = float('inf')
+    best_result = None
+
+    for trial, params in enumerate(param_list, 1):
+        cv_params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'verbosity': 0,
+            **params,
+        }
+
+        cv_results = xgb.cv(
+            params=cv_params,
+            dtrain=dtrain,
+            num_boost_round=1000,
+            nfold=nfold,
+            early_stopping_rounds=early_stopping_rounds,
+            seed=random_state,
+            verbose_eval=False,
+            as_pandas=True,
+        )
+
+        trial_rmse = cv_results['test-rmse-mean'].min()
+        trial_rounds = int(cv_results['test-rmse-mean'].idxmin() + 1)
+
+        print(
+            f"Trial {trial}/{len(param_list)}: rmse={trial_rmse:.4f}, rounds={trial_rounds}, "
+            f"params={{learning_rate: {params['learning_rate']}, max_depth: {params['max_depth']}, subsample: {params['subsample']}, "
+            f"colsample_bytree: {params['colsample_bytree']}, min_child_weight: {params['min_child_weight']}, "
+            f"reg_alpha: {params['reg_alpha']}, reg_lambda: {params['reg_lambda']}}}"
+        )
+
+        if trial_rmse < best_score:
+            best_score = trial_rmse
+            best_result = {
+                'params': cv_params,
+                'best_rounds': trial_rounds,
+                'best_rmse': trial_rmse,
+                'cv_results': cv_results,
+            }
+
+    return best_result
+
+param_grid = {
+    'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],
+    'max_depth': [4, 6, 8, 10],
+    'subsample': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'min_child_weight': [1, 3, 5, 7],
+    'reg_alpha': [0.0, 0.1, 0.5, 1.0],
+    'reg_lambda': [0.5, 1.0, 1.5, 2.0],
+}
+
+best_search = xgb_cv_best_params(
+    X_train,
+    y_train,
+    param_grid,
+    n_iter=20,
+    nfold=5,
+    early_stopping_rounds=25,
+    random_state=42,
+)
+
+print(f"Best CV rmse: {best_search['best_rmse']:.4f} at {best_search['best_rounds']} rounds")
+print('Best XGBoost parameters:')
+print({k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']})
+
+# Use the best CV parameters for the final model training
+xgb_params = {k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']}
+```
+
+# 4. Train Base Model
+
+```{python}
+xgb_model = XGBRegressor(
+    n_estimators=best_search['best_rounds'],
+    n_jobs=-1,
+    random_state=42,
+    verbosity=0,
+    **xgb_params
+)
+
+xgb_model.fit(X_train.to_numpy(), y_train.to_numpy())
+```
+
+# 5. Evaluate XGBoost
+
+```{python}
+raw_pred_xgb = xgb_model.predict(X_test.to_numpy())
+
+if use_log_target:
+    pred_xgb = np.exp(raw_pred_xgb)
+else:
+    pred_xgb = raw_pred_xgb
+
+final_rmse = root_mean_squared_error(y_test_raw.to_numpy(), pred_xgb)
+final_r2 = r2_score(y_test_raw.to_numpy(), pred_xgb)
+
+# Predict on the training data
+raw_pred_train_xgb = xgb_model.predict(X_train.to_numpy())
+if use_log_target:
+    pred_train_xgb = np.exp(raw_pred_train_xgb)
+else:
+    pred_train_xgb = raw_pred_train_xgb
+
+train_rmse = root_mean_squared_error(y_train_raw.to_numpy(), pred_train_xgb)
+
+print(f'Training RMSE: {train_rmse:.2f}')
+print(f'Testing RMSE: {final_rmse:.2f}')
+print(f'XGBoost R2: {final_r2:.3f}')
+```
+
+```{python}
+pred_df = pd.DataFrame({
+    'actual': y_test_raw.to_numpy(),
+    'XGBoost': pred_xgb
+})
+
+(ggplot(pred_df, aes(x='actual', y='XGBoost'))
+ + geom_point(alpha=0.5, size=2, color='#1f78b4')
+ + geom_abline(intercept=0, slope=1, linetype='dashed', color='black')
+ + ggtitle('Actual vs Predicted: XGBoost')
+ + xlab('Actual Price')
+ + ylab('Predicted Price')
+ + theme_minimal2()
+)
+```
+
+```{python}
+feature_names = model_feature_cols
+
+xgb_importances = xgb_model.feature_importances_
+
+xgb_importance_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance': xgb_importances
+}).sort_values('Importance', ascending=False).head(15)
+
+(ggplot(xgb_importance_df, aes(x='Importance', y=as_discrete('Feature', order_by='Importance'), fill='Importance'))
+ + geom_bar(stat='identity')
+ + scale_fill_gradient(low='#d1e5f0', high='#053061')
+ + ggtitle('Top 15 XGBoost Feature Importances')
+ + theme_minimal2()
+)
+```
+
+
+
+# 6. Holdout Prediction
+
+```{python}
+mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = preprocess_housing(mini_X)
+
+if assign_school_boundaries_to_houses is not None:
+    try:
+        mini_X = pl.from_pandas(assign_school_boundaries_to_houses(mini_X.to_pandas()))
+        school_label_cols = [
+            col for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']
+            if col in mini_X.columns
+        ]
+        if len(school_label_cols) > 0:
+            mini_X_pd = mini_X.to_pandas()
+            for col in school_label_cols:
+                mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype('category')
+                mini_X_pd[f'{col}_code'] = mini_X_pd[col].cat.codes
+            mini_X = pl.from_pandas(mini_X_pd)
+        print('Assigned school boundaries for holdout data.')
+    except Exception as e:
+        print('Could not assign school boundaries for holdout data:', e)
+
+mini_X = build_spatial_features(mini_X)
+mini_nn_median = get_leakage_free_nn_median(
+    X_train['lat'].to_numpy(),
+    X_train['long'].to_numpy(),
+    y_train_raw.to_numpy(),
+    mini_X['lat'].to_numpy(),
+    mini_X['long'].to_numpy(),
+    k=15,
+)[1]
+mini_X = mini_X.with_columns(pl.Series('nn_median_price', mini_nn_median))
+mini_X = mini_X.select(model_feature_cols)
+
+raw_pred_mini_xgb = xgb_model.predict(mini_X.to_numpy())
+if use_log_target:
+    mini_preds = np.exp(raw_pred_mini_xgb)
+else:
+    mini_preds = raw_pred_mini_xgb
+
+output = pl.DataFrame(mini_preds, schema=['price'])
+output.write_csv('sanhedrin3-module3-predictions.csv')
+print('Holdout predictions saved to sanhedrin3-module3-predictions.csv')
+```
