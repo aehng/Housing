@@ -65,6 +65,10 @@ def preprocess_housing(df):
     df['basement_proportion'] = df['sqft_basement'] / df['sqft_living'].replace(0, 1)
     df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
     df = df.drop(columns=['sqft_living', 'zipcode'])
+    if 'lat' in df.columns:
+        df['lat'] = df['lat'].round(3)
+    if 'long' in df.columns:
+        df['long'] = df['long'].round(3)
     df['bedrooms'] = np.where(df['bedrooms'] > 30, df['bedrooms'] // 10, df['bedrooms'])
     df['month'] = df['date'].astype(str).str.slice(4, 6).astype(int)
     df = df.drop(columns=['date'])
@@ -320,7 +324,7 @@ X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
 
 # 3b. Leakage-free KNN median price feature
 
-def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=15):
+def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=30):
     train_coords = np.radians(np.column_stack((train_lat, train_lon)))
     test_coords = np.radians(np.column_stack((test_lat, test_lon)))
 
@@ -342,7 +346,7 @@ train_nn_median, test_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     X_test['lat'].to_numpy(),
     X_test['long'].to_numpy(),
-    k=15,
+    k=30,
 )
 
 X_train['nn_median_price'] = train_nn_median
@@ -394,7 +398,7 @@ def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=30, rando
             'eval_metric': 'rmse',
             'verbosity': 0,
             'learning_rate': trial.suggest_categorical('learning_rate', [0.01, 0.03]),
-            'max_depth': trial.suggest_categorical('max_depth', [3, 4, 5]),
+            'max_depth': trial.suggest_categorical('max_depth', [3, 4]),
             'subsample': trial.suggest_categorical('subsample', [0.5, 0.6, 0.7, 0.8]),
             'colsample_bytree': trial.suggest_categorical('colsample_bytree', [0.5, 0.6, 0.7, 0.8]),
             'min_child_weight': trial.suggest_categorical('min_child_weight', [10, 15, 20, 25]),
@@ -626,7 +630,7 @@ mini_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     mini_X['lat'].to_numpy(),
     mini_X['long'].to_numpy(),
-    k=15,
+    k=30,
 )[1]
 mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]

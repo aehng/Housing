@@ -10,6 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import root_mean_squared_error, r2_score
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
+import xgboost as xgb
 from xgboost import XGBRegressor
 
 try:
@@ -672,7 +673,7 @@ mini_nn_median = get_leakage_free_nn_median(
 mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]
 
-mini_features = mini_X_pd[model_feature_cols]
+mini_features = mini_X[model_feature_cols]
 raw_pred_mini_lgbm = best_lgbm.predict(mini_features)
 raw_pred_mini_cat = best_catboost.predict(mini_features)
 raw_pred_mini_xgb = best_xgb.predict(mini_features)
