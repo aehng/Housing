@@ -397,7 +397,7 @@ def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=30, rando
             'objective': 'reg:squarederror',
             'eval_metric': 'rmse',
             'verbosity': 0,
-            'learning_rate': trial.suggest_categorical('learning_rate', [0.01, 0.03]),
+            'learning_rate': trial.suggest_categorical('learning_rate', [0.01, 0.03, 0.05]),
             'max_depth': trial.suggest_categorical('max_depth', [3, 4]),
             'subsample': trial.suggest_categorical('subsample', [0.5, 0.6, 0.7, 0.8]),
             'colsample_bytree': trial.suggest_categorical('colsample_bytree', [0.5, 0.6, 0.7, 0.8]),
@@ -463,21 +463,7 @@ def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=30, rando
     }
     return best_result
 
-best_search = xgb_cv_best_params(
-    X_train_pd,
-    y_train,
-    n_iter=20,
-    nfold=5,
-    early_stopping_rounds=30,
-    random_state=42,
-)
-
-print(f"Best CV rmse: {best_search['best_rmse']:.4f} at {best_search['best_rounds']} rounds")
-print('Best XGBoost parameters:')
-print({k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']})
-
-# Use the best CV parameters for the final model training
-xgb_params = {k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']}
+# Optuna hyperparameter tuning will be run after feature selection, on the selected feature subset.
 ```
 
 # 4. Train Base Model & Select Features
@@ -502,12 +488,13 @@ selector = RFECV(
 )
 
 core_features = [
-    'bedrooms', 'bathrooms', 'sqft_lot', 'sqft_lot15', 'floors', 'waterfront',
-    'view', 'condition', 'grade', 'sqft_above', 'sqft_basement', 'yr_built',
-    'years_since_renovation', 'lat', 'long', 'living_to_lot_ratio',
-    'bed_bath_ratio', 'sqft_per_bedroom', 'basement_proportion',
+    'bedrooms', 'bathrooms', 'sqft_lot', 'sqft_lot15', 'floors', 'waterfront', 
+    'view', 'condition', 'grade', 'sqft_above', 'sqft_basement', 'yr_built', 
+    'years_since_renovation', 'lat', 'long', 'living_to_lot_ratio', 
+    'bed_bath_ratio', 'sqft_per_bedroom', 'basement_proportion', 
     'sqft_living_to_neighbors', 'month', 'assigned_elementary_score', 'nn_median_price'
 ]
+
 core_features = [c for c in core_features if c in X_train_pd.columns]
 spatial_features = [c for c in X_train_pd.columns if c not in core_features]
 
@@ -524,6 +511,22 @@ model_feature_cols = core_features + surviving_spatial
 
 X_train_selected = X_train_pd[model_feature_cols]
 X_test_selected = X_test_pd[model_feature_cols]
+
+best_search = xgb_cv_best_params(
+    X_train_selected,
+    y_train,
+    n_iter=20,
+    nfold=5,
+    early_stopping_rounds=30,
+    random_state=42,
+)
+
+print(f"Best CV rmse: {best_search['best_rmse']:.4f} at {best_search['best_rounds']} rounds")
+print('Best XGBoost parameters:')
+print({k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']})
+
+# Use the best CV parameters for the final model training
+xgb_params = {k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']}
 
 xgb_model = XGBRegressor(
     n_estimators=best_search['best_rounds'],
