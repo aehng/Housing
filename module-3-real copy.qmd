@@ -57,14 +57,10 @@ def add_years_since_renovation(df):
 
 def preprocess_housing(df):
     df = df.copy()
-    df = df.drop(columns=['id'])
+    df = df.drop(columns=['id', 'zipcode'])
     df = add_years_since_renovation(df).drop(columns=['yr_renovated'])
-    df['living_to_lot_ratio'] = df['sqft_living'] / df['sqft_lot'].replace(0, 1)
-    df['bed_bath_ratio'] = df['bedrooms'] / df['bathrooms'].replace(0, 0.5)
-    df['sqft_per_bedroom'] = df['sqft_living'] / df['bedrooms'].replace(0, 1)
-    df['basement_proportion'] = df['sqft_basement'] / df['sqft_living'].replace(0, 1)
     df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
-    df = df.drop(columns=['sqft_living', 'zipcode'])
+    df = df.drop(columns=['sqft_living'])
     if 'lat' in df.columns:
         df['lat'] = df['lat'].round(3)
     if 'long' in df.columns:
@@ -290,23 +286,7 @@ def build_spatial_features(dataset: pd.DataFrame) -> pd.DataFrame:
 ```{python}
 housing = preprocess_housing(housing)
 
-if assign_school_boundaries_to_houses is not None:
-    try:
-        housing = assign_school_boundaries_to_houses(housing)
-        school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
-        if len(school_label_cols) > 0:
-            for col in school_label_cols:
-                housing[col] = housing[col].fillna('missing').astype(str)
-        print('Assigned elementary school boundaries for target encoding.')
-    except Exception as e:
-        print('Could not assign school boundaries:', e)
-
 housing = build_spatial_features(housing)
-
-school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
-school_cols_to_remove = [col for col in ['assigned_middle', 'assigned_high'] if col in housing.columns]
-if school_cols_to_remove:
-    housing = housing.drop(columns=school_cols_to_remove)
 
 if use_log_target:
     housing['log_price'] = np.log(housing['price'])
@@ -324,7 +304,7 @@ X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
 
 # 3b. Leakage-free KNN median price feature
 
-def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=30):
+def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=75):
     train_coords = np.radians(np.column_stack((train_lat, train_lon)))
     test_coords = np.radians(np.column_stack((test_lat, test_lon)))
 
@@ -346,7 +326,7 @@ train_nn_median, test_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     X_test['lat'].to_numpy(),
     X_test['long'].to_numpy(),
-    k=30,
+    k=75,
 )
 
 X_train['nn_median_price'] = train_nn_median
@@ -356,36 +336,6 @@ model_feature_cols = list(X_train.columns)
 
 X_train_pd = X_train
 X_test_pd = X_test
-school_target_maps = {}
-overall_median_price = np.median(y_train_raw.to_numpy())
-m_weight = 50
-for col in school_label_cols:
-    if col not in X_train_pd.columns:
-        continue
-
-    X_train_pd[col] = X_train_pd[col].fillna('missing').astype(str)
-    if col in X_test_pd.columns:
-        X_test_pd[col] = X_test_pd[col].fillna('missing').astype(str)
-
-    stats = pd.DataFrame({
-        'count': X_train_pd.groupby(col).size(),
-        'median': pd.Series(y_train_raw.to_numpy(), index=X_train_pd.index).groupby(X_train_pd[col]).median(),
-    })
-    stats['smoothed_score'] = (
-        (stats['count'] * stats['median'] + m_weight * overall_median_price) /
-        (stats['count'] + m_weight)
-    )
-
-    school_target_maps[col] = stats['smoothed_score'].to_dict()
-
-    X_train_pd[f'{col}_score'] = X_train_pd[col].map(school_target_maps[col]).fillna(overall_median_price)
-    if col in X_test_pd.columns:
-        X_test_pd[f'{col}_score'] = X_test_pd[col].map(school_target_maps[col]).fillna(overall_median_price)
-    else:
-        X_test_pd[f'{col}_score'] = overall_median_price
-
-X_train_pd = X_train_pd.drop(columns=[col for col in school_label_cols if col in X_train_pd.columns])
-X_test_pd = X_test_pd.drop(columns=[col for col in school_label_cols if col in X_test_pd.columns])
 
 # 3c. XGBoost CV-based hyperparameter tuning
 
@@ -488,11 +438,10 @@ selector = RFECV(
 )
 
 core_features = [
-    'bedrooms', 'bathrooms', 'sqft_lot', 'sqft_lot15', 'floors', 'waterfront', 
-    'view', 'condition', 'grade', 'sqft_above', 'sqft_basement', 'yr_built', 
-    'years_since_renovation', 'lat', 'long', 'living_to_lot_ratio', 
-    'bed_bath_ratio', 'sqft_per_bedroom', 'basement_proportion', 
-    'sqft_living_to_neighbors', 'month', 'assigned_elementary_score', 'nn_median_price'
+    'bedrooms', 'bathrooms', 'sqft_lot', 'floors', 'waterfront',
+    'view', 'condition', 'grade', 'sqft_above', 'sqft_basement', 'yr_built',
+    'years_since_renovation', 'lat', 'long', 'sqft_living_to_neighbors',
+    'sqft_living15', 'sqft_lot15', 'month', 'nn_median_price'
 ]
 
 core_features = [c for c in core_features if c in X_train_pd.columns]
@@ -608,24 +557,6 @@ xgb_importance_df = pd.DataFrame({
 mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
 mini_X = preprocess_housing(mini_X)
 
-if assign_school_boundaries_to_houses is not None:
-    try:
-        mini_X = assign_school_boundaries_to_houses(mini_X)
-        school_label_cols = [
-            col for col in ['assigned_elementary']
-            if col in mini_X.columns
-        ]
-        school_cols_to_remove = [col for col in ['assigned_middle', 'assigned_high'] if col in mini_X.columns]
-        if len(school_cols_to_remove) > 0:
-            mini_X = mini_X.drop(columns=school_cols_to_remove)
-        if len(school_label_cols) > 0:
-            for col in school_label_cols:
-                mini_X[col] = mini_X[col].fillna('missing').astype(str)
-                mini_X[f'{col}_score'] = mini_X[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
-        print('Assigned elementary school boundaries for holdout target encoding.')
-    except Exception as e:
-        print('Could not assign school boundaries for holdout data:', e)
-
 mini_X = build_spatial_features(mini_X)
 mini_nn_median = get_leakage_free_nn_median(
     X_train['lat'].to_numpy(),
@@ -633,7 +564,7 @@ mini_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     mini_X['lat'].to_numpy(),
     mini_X['long'].to_numpy(),
-    k=30,
+    k=75,
 )[1]
 mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]
