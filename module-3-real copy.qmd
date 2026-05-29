@@ -394,12 +394,12 @@ def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=20, rando
             'eval_metric': 'rmse',
             'verbosity': 0,
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 6),
-            'subsample': trial.suggest_float('subsample', 0.5, 0.9),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.9),
+            'max_depth': trial.suggest_int('max_depth', 3, 5),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.8),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.8),
             'min_child_weight': trial.suggest_int('min_child_weight', 10, 25),
-            'reg_alpha': trial.suggest_float('reg_alpha', 0.1, 5.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 5.0, log=True),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1.0, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1.0, 10.0, log=True),
         }
 
         cv_results = xgb.cv(
