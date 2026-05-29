@@ -354,7 +354,7 @@ X_train_pd = X_train
 X_test_pd = X_test
 school_target_maps = {}
 overall_median_price = np.median(y_train_raw.to_numpy())
-m_weight = 10
+m_weight = 50
 for col in school_label_cols:
     if col not in X_train_pd.columns:
         continue
@@ -385,7 +385,7 @@ X_test_pd = X_test_pd.drop(columns=[col for col in school_label_cols if col in X
 
 # 3c. XGBoost CV-based hyperparameter tuning
 
-def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=20, random_state=42):
+def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=30, random_state=42):
     dtrain = xgb.DMatrix(X, label=y.to_numpy())
 
     def objective(trial):
@@ -393,13 +393,13 @@ def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=20, rando
             'objective': 'reg:squarederror',
             'eval_metric': 'rmse',
             'verbosity': 0,
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 5),
-            'subsample': trial.suggest_float('subsample', 0.5, 0.8),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.8),
-            'min_child_weight': trial.suggest_int('min_child_weight', 10, 25),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1.0, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1.0, 10.0, log=True),
+            'learning_rate': trial.suggest_categorical('learning_rate', [0.01, 0.03]),
+            'max_depth': trial.suggest_categorical('max_depth', [3, 4, 5]),
+            'subsample': trial.suggest_categorical('subsample', [0.5, 0.6, 0.7, 0.8]),
+            'colsample_bytree': trial.suggest_categorical('colsample_bytree', [0.5, 0.6, 0.7, 0.8]),
+            'min_child_weight': trial.suggest_categorical('min_child_weight', [10, 15, 20, 25]),
+            'reg_alpha': trial.suggest_categorical('reg_alpha', [1.0, 3.0, 5.0]),
+            'reg_lambda': trial.suggest_categorical('reg_lambda', [1.0, 3.0, 5.0]),
         }
 
         cv_results = xgb.cv(
@@ -464,7 +464,7 @@ best_search = xgb_cv_best_params(
     y_train,
     n_iter=20,
     nfold=5,
-    early_stopping_rounds=50,
+    early_stopping_rounds=30,
     random_state=42,
 )
 

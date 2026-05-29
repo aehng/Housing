@@ -416,7 +416,7 @@ def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test
 
 housing = build_spatial_features(housing)
 
-housing_pd = housing.to_pandas()
+housing_pd = housing
 
 school_label_cols = [col for col in ['assigned_elementary'] if col in housing_pd.columns]
 remaining_school_cols = [col for col in ['assigned_middle', 'assigned_high'] if col in housing_pd.columns]
