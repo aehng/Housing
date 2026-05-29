@@ -304,7 +304,7 @@ X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
 
 # 3b. Leakage-free KNN median price feature
 
-def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=75):
+def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=30):
     train_coords = np.radians(np.column_stack((train_lat, train_lon)))
     test_coords = np.radians(np.column_stack((test_lat, test_lon)))
 
@@ -326,7 +326,7 @@ train_nn_median, test_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     X_test['lat'].to_numpy(),
     X_test['long'].to_numpy(),
-    k=75,
+    k=30,
 )
 
 X_train['nn_median_price'] = train_nn_median
@@ -564,7 +564,7 @@ mini_nn_median = get_leakage_free_nn_median(
     y_train_raw.to_numpy(),
     mini_X['lat'].to_numpy(),
     mini_X['long'].to_numpy(),
-    k=75,
+    k=30,
 )[1]
 mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]
