@@ -327,6 +327,23 @@ def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
     return dataset.with_columns([pl.Series(name, values) for name, values in features.items()])
 
 
+def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=15):
+    train_coords = np.radians(np.column_stack((train_lat, train_lon)))
+    test_coords = np.radians(np.column_stack((test_lat, test_lon)))
+
+    nn = NearestNeighbors(n_neighbors=k + 1, metric='haversine')
+    nn.fit(train_coords)
+
+    _, train_indices = nn.kneighbors(train_coords, n_neighbors=k + 1)
+    train_indices_no_self = train_indices[:, 1:]
+    train_nn_median = np.median(train_price[train_indices_no_self], axis=1)
+
+    _, test_indices = nn.kneighbors(test_coords, n_neighbors=k)
+    test_nn_median = np.median(train_price[test_indices], axis=1)
+
+    return train_nn_median, test_nn_median
+
+
 housing = build_spatial_features(housing)
 
 housing_pd = housing.to_pandas()
@@ -349,6 +366,17 @@ y_raw = housing_pd['price']
 X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
     X, y, y_raw, test_size=0.2, random_state=42
 )
+
+train_nn_median, test_nn_median = get_leakage_free_nn_median(
+    X_train['lat'].to_numpy(),
+    X_train['long'].to_numpy(),
+    y_train_raw.to_numpy(),
+    X_test['lat'].to_numpy(),
+    X_test['long'].to_numpy(),
+    k=15,
+)
+X_train['nn_median_price'] = train_nn_median
+X_test['nn_median_price'] = test_nn_median
 
 school_target_maps, overall_median_price = build_school_target_maps(
     X_train,
@@ -575,8 +603,6 @@ for col in school_label_cols:
     mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype(str)
     mini_X_pd[f'{col}_score'] = mini_X_pd[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
 
-mini_X_pd = mini_X_pd[model_feature_cols]
-
 mini_nn_median = get_leakage_free_nn_median(
     X_train['lat'].to_numpy(),
     X_train['long'].to_numpy(),
@@ -586,6 +612,7 @@ mini_nn_median = get_leakage_free_nn_median(
     k=15,
 )[1]
 mini_X_pd['nn_median_price'] = mini_nn_median
+mini_X_pd = mini_X_pd[model_feature_cols]
 
 mini_features = mini_X_pd[model_feature_cols]
 raw_pred_mini_lgbm = best_lgbm.predict(mini_features.to_numpy())
