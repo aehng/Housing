@@ -1,0 +1,242 @@
+---
+title: "Data Insights"
+format: html
+---
+
+## Grade vs Price
+
+This plot shows how house `grade` relates to sale `price` in the dataset.
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+from pyproj import Transformer
+from lets_plot import *
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+
+LetsPlot.setup_html()
+
+transformer = Transformer.from_crs('EPSG:2285', 'EPSG:4326', always_xy=True)
+CONVERTED_DATA = 'converted_data.csv'
+RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
+
+
+def add_years_since_renovation(df):
+    df = df.copy()
+    date_year = df['date'].astype(str).str.slice(0, 4).astype(int)
+    df['years_since_renovation'] = np.where(
+        df['yr_renovated'] == 0,
+        date_year - df['yr_built'],
+        date_year - df['yr_renovated'],
+    )
+    return df
+
+
+def preprocess_housing(df):
+    df = df.copy()
+    df = df.drop(columns=['id', 'zipcode'])
+    df = add_years_since_renovation(df).drop(columns=['yr_renovated'])
+    df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
+    df = df.drop(columns=['sqft_living'])
+    if 'lat' in df.columns:
+        df['lat'] = df['lat'].round(3)
+    if 'long' in df.columns:
+        df['long'] = df['long'].round(3)
+    df['bedrooms'] = np.where(df['bedrooms'] > 30, df['bedrooms'] // 10, df['bedrooms'])
+    df['month'] = df['date'].astype(str).str.slice(4, 6).astype(int)
+    df = df.drop(columns=['date'])
+    return df
+
+
+def convert_to_latlon(row):
+    try:
+        lon, lat = transformer.transform(row['x'], row['y'])
+        return pd.Series({'Longitude': lon, 'Latitude': lat})
+    except Exception:
+        return pd.Series({'Longitude': None, 'Latitude': None})
+
+
+def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
+    if os.path.exists(path):
+        return pd.read_csv(path)
+
+    df = pd.read_csv(source)
+    df[['Longitude', 'Latitude']] = df.apply(convert_to_latlon, axis=1)
+    df.to_csv(path, index=False)
+    return df
+
+
+def haversine_distance(lon1, lat1, lon2, lat2):
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return 3958.8 * c
+
+
+category_groups = {
+    'neighborhood_center': [90],
+    'entertainment': [240, 270, 480],
+    'golf': [300],
+    'healthcare': [330, 340],
+    'library': [390],
+    'employer': [420],
+    'transit': [500, 510],
+    'park': [600],
+    'elementary_school': [660],
+    'middle_school': [661],
+    'high_school': [662],
+    'community_school': [664],
+    'private_school': [666],
+    'mall': [690],
+    'grocery': [695],
+    'church': [800],
+}
+
+radius_map = {
+    'park': [0.5, 1.0, 2.0],
+    'grocery': [0.5, 1.0],
+    'transit': [0.5, 1.0],
+    'elementary_school': [0.5, 1.0],
+    'middle_school': [1.0, 1.5],
+    'high_school': [1.0, 1.5],
+    'community_school': [1.0, 1.5],
+    'private_school': [1.0, 1.5],
+    'library': [1.0, 1.5],
+    'church': [1.0, 1.5],
+    'mall': [3.0, 5.0],
+    'healthcare': [3.0, 5.0],
+    'golf': [5.0],
+    'entertainment': [3.0, 5.0],
+    'employer': [3.0, 5.0],
+    'neighborhood_center': [1.0, 3.0],
+}
+
+
+
+def build_spatial_features(dataset: pd.DataFrame) -> pd.DataFrame:
+    dataset = dataset.copy()
+    house_lon = dataset['long'].to_numpy()
+    house_lat = dataset['lat'].to_numpy()
+
+    dataset['distance_to_downtown'] = haversine_distance(
+        house_lon,
+        house_lat,
+        np.full_like(house_lon, -122.3321),
+        np.full_like(house_lat, 47.6062),
+    )
+
+    def min_dist(category):
+        coords = poi_coords.get(category)
+        if coords is None or len(coords) == 0:
+            return np.full(len(house_lon), np.nan)
+        lon2 = coords[:, 0][None, :]
+        lat2 = coords[:, 1][None, :]
+        dist = haversine_distance(house_lon[:, None], house_lat[:, None], lon2, lat2)
+        return dist.min(axis=1)
+
+    def count_within(category, radius):
+        coords = poi_coords.get(category)
+        if coords is None or len(coords) == 0:
+            return np.zeros(len(house_lon), dtype=int)
+        lon2 = coords[:, 0][None, :]
+        lat2 = coords[:, 1][None, :]
+        dist = haversine_distance(house_lon[:, None], house_lat[:, None], lon2, lat2)
+        return (dist <= radius).sum(axis=1)
+
+    for category in category_groups:
+        dataset[f'min_dist_{category}'] = min_dist(category)
+        if category in radius_map:
+            for radius in radius_map[category]:
+                dataset[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
+
+    return dataset
+
+
+housing = pd.read_csv(
+    'https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv',
+    parse_dates=['date'],
+)
+
+housing = preprocess_housing(housing)
+housing['price_k'] = housing['price'] / 1000
+
+poi = ensure_converted_poi()
+poi['CODE'] = poi['CODE'].astype(int)
+category_map = {
+    90: 'neighborhood_center',
+    240: 'entertainment',
+    270: 'entertainment',
+    300: 'golf',
+    330: 'healthcare',
+    340: 'healthcare',
+    390: 'library',
+    420: 'employer',
+    480: 'entertainment',
+    500: 'transit',
+    510: 'transit',
+    600: 'park',
+    660: 'elementary_school',
+    661: 'middle_school',
+    662: 'high_school',
+    664: 'community_school',
+    666: 'private_school',
+    690: 'mall',
+    695: 'grocery',
+    800: 'church',
+}
+poi['category'] = poi['CODE'].map(category_map).fillna('other')
+
+poi_groups = {
+    cat: poi.loc[poi['category'] == cat, ['Longitude', 'Latitude']].to_numpy()
+    for cat in category_groups
+}
+
+poi_coords = {cat: coords for cat, coords in poi_groups.items() if len(coords) > 0}
+
+housing = build_spatial_features(housing)
+
+housing.columns
+```
+
+```{python}
+p = ggplot(housing, aes(x='grade', y='price_k')) + \
+    geom_boxplot(fill='#5B84B1', alpha=0.75) + \
+    scale_y_continuous(name='Price (thousands USD)', trans='log10') + \
+    ggtitle('House Price by Grade') + \
+    xlab('Grade') + \
+    theme(axis_text_x=element_text(hjust=0.5),
+          panel_grid_major=element_line(color='#DDDDDD'))
+
+p
+```
+
+```{python}
+p2 = ggplot(housing, aes(x='grade', y='price_k')) + \
+    geom_point(alpha=0.2, color='#FF7F0E') + \
+    scale_y_continuous(name='Price (thousands USD)', trans='log10') + \
+    ggtitle('Price vs Grade (Scatter)') + \
+    xlab('Grade') + \
+    theme(panel_grid_major=element_line(color='#DDDDDD'))
+
+p2
+```
+
+```{python}
+p3 = ggplot(housing, aes(x='min_dist_transit', y='price_k')) + \
+    geom_point(alpha=0.15, color='#2E8B57') + \
+    scale_y_continuous(name='Price (thousands USD)', trans='log10') + \
+    ggtitle('Price vs Distance to Nearest Golf Course') + \
+    xlab('Distance to Nearest Golf Course') + \
+    theme(panel_grid_major=element_line(color='#DDDDDD'))
+
+p3
+```

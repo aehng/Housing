@@ -21,13 +21,6 @@ except ImportError:
 
 transformer = Transformer.from_crs('EPSG:2285', 'EPSG:4326', always_xy=True)
 
-SCHOOL_SHAPEFILE_ROOT = os.path.join('SABS_1516_SchoolLevels', 'SABS_1516_SchoolLevels')
-SCHOOL_LAYERS = {
-    'elementary': 'SABS_1516_Primary.shp',
-    'middle': 'SABS_1516_Middle.shp',
-    'high': 'SABS_1516_High.shp',
-}
-
 CONVERTED_DATA = 'converted_data.csv'
 RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
 
@@ -89,71 +82,7 @@ def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
     return df
 
 
-def _get_name_column(gdf):
-    for candidate in ['schnam', 'schoolname', 'name', 'schnm']:
-        if candidate in gdf.columns:
-            return candidate
-    return None
 
-
-def _read_school_layer(path):
-    if not GEOPANDAS_AVAILABLE:
-        raise ImportError('geopandas is required for school boundary joins')
-    layer = gpd.read_file(path)
-    if layer.crs is None:
-        raise ValueError(f'CRS missing on {path}')
-    return layer
-
-
-def assign_school_boundaries_to_houses(houses_df):
-    if not GEOPANDAS_AVAILABLE:
-        raise ImportError('geopandas is required for school boundary joins')
-
-    houses = houses_df.copy()
-    for col in ['assigned_elementary', 'assigned_middle', 'assigned_high']:
-        if col in houses.columns:
-            houses = houses.drop(columns=[col])
-
-    if 'Longitude' not in houses.columns or 'Latitude' not in houses.columns:
-        if 'long' in houses.columns and 'lat' in houses.columns:
-            houses['Longitude'] = houses['long']
-            houses['Latitude'] = houses['lat']
-        else:
-            raise ValueError('House dataframe must contain long/lat or Longitude/Latitude columns')
-
-    houses_gdf = gpd.GeoDataFrame(
-        houses,
-        geometry=gpd.points_from_xy(houses['Longitude'], houses['Latitude']),
-        crs='EPSG:4326',
-    )
-
-    for level, shapefile in SCHOOL_LAYERS.items():
-        path = os.path.join(SCHOOL_SHAPEFILE_ROOT, shapefile)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f'Shapefile not found: {path}')
-
-        layer = _read_school_layer(path)
-        if layer.crs != houses_gdf.crs:
-            layer = layer.to_crs(houses_gdf.crs)
-
-        name_col = _get_name_column(layer)
-        if name_col is None:
-            raise ValueError(f'No school name column found in {path}')
-
-        layer = layer[[name_col, 'geometry']].rename(columns={name_col: f'assigned_{level}'})
-        joined = gpd.sjoin(houses_gdf, layer, how='left', predicate='within')
-        if f'assigned_{level}' not in joined.columns:
-            raise ValueError(f'Expected assigned column missing after join for level {level}')
-
-        joined = joined.reset_index().rename(columns={'index': 'house_index'})
-        assigned_series = joined.groupby('house_index')[f'assigned_{level}'].first()
-        houses_gdf[f'assigned_{level}'] = houses_gdf.index.to_series().map(assigned_series)
-
-    result = houses_gdf.drop(columns=['geometry'])
-    for temp_col in ['Longitude', 'Latitude']:
-        if temp_col in result.columns:
-            result = result.drop(columns=[temp_col])
-    return pd.DataFrame(result)
 ```
 
 # 2b. Spatial POI Feature Engineering
