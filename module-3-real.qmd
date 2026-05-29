@@ -1,11 +1,11 @@
 ```{python}
 import os
-import polars as pl
 import pandas as pd
 import numpy as np
+import optuna
 from pyproj import Transformer
 from lets_plot import *
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import root_mean_squared_error, r2_score
 from lightgbm import LGBMRegressor
@@ -38,38 +38,36 @@ use_log_target = False  # Set True to train on log(price) and inverse-transform 
 # 1. Load Data
 
 ```{python}
-housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
+housing = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
 ```
 
 # 2. Feature Engineering Helpers
 
 ```{python}
 def add_years_since_renovation(df):
-    return df.with_columns(
-        pl.when(pl.col('yr_renovated') == 0)
-        .then(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_built'))
-        .otherwise(pl.col('date').str.slice(0, 4).cast(pl.Int32) - pl.col('yr_renovated'))
-        .alias('years_since_renovation')
+    df = df.copy()
+    date_year = df['date'].astype(str).str.slice(0, 4).astype(int)
+    df['years_since_renovation'] = np.where(
+        df['yr_renovated'] == 0,
+        date_year - df['yr_built'],
+        date_year - df['yr_renovated'],
     )
+    return df
 
 
 def preprocess_housing(df):
-    df = df.drop('id')
-    df = add_years_since_renovation(df).drop('yr_renovated')
-    df = df.with_columns(
-        (pl.col('sqft_living') / pl.col('sqft_living15')).alias('sqft_living_to_neighbors')
-    )
-    df = df.drop('sqft_living')
-    df = df.drop('zipcode')
-    df = df.with_columns(
-        pl.when(pl.col('bedrooms') > 30)
-        .then(pl.col('bedrooms') // 10)
-        .otherwise(pl.col('bedrooms'))
-        .alias('bedrooms')
-    )
-    df = df.with_columns(
-        pl.col('date').str.slice(4, 2).cast(pl.Int32).alias('month')
-    ).drop('date')
+    df = df.copy()
+    df = df.drop(columns=['id'])
+    df = add_years_since_renovation(df).drop(columns=['yr_renovated'])
+    df['living_to_lot_ratio'] = df['sqft_living'] / df['sqft_lot'].replace(0, 1)
+    df['bed_bath_ratio'] = df['bedrooms'] / df['bathrooms'].replace(0, 0.5)
+    df['sqft_per_bedroom'] = df['sqft_living'] / df['bedrooms'].replace(0, 1)
+    df['basement_proportion'] = df['sqft_basement'] / df['sqft_living'].replace(0, 1)
+    df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
+    df = df.drop(columns=['sqft_living', 'zipcode'])
+    df['bedrooms'] = np.where(df['bedrooms'] > 30, df['bedrooms'] // 10, df['bedrooms'])
+    df['month'] = df['date'].astype(str).str.slice(4, 6).astype(int)
+    df = df.drop(columns=['date'])
     return df
 
 
@@ -81,32 +79,107 @@ def convert_to_latlon(row):
         return pd.Series({'Longitude': None, 'Latitude': None})
 
 
-def build_school_target_maps(X_train: pd.DataFrame, y_train: pd.Series, cols):
+def build_school_target_maps(X_train: pd.DataFrame, y_train: pd.Series, cols, m_weight=10):
     target_maps = {}
     overall_median_price = y_train.median()
     for col in cols:
         if col not in X_train.columns:
             continue
-        target_maps[col] = y_train.groupby(X_train[col]).median().to_dict()
+
+        stats = pd.DataFrame({
+            'count': X_train.groupby(col).size(),
+            'median': pd.Series(y_train.to_numpy(), index=X_train.index).groupby(X_train[col]).median(),
+        })
+        stats['smoothed_score'] = (
+            (stats['count'] * stats['median'] + m_weight * overall_median_price) /
+            (stats['count'] + m_weight)
+        )
+
+        target_maps[col] = stats['smoothed_score'].to_dict()
     return target_maps, overall_median_price
 
 
-def run_random_search(estimator, param_distributions, X, y, n_iter=15):
-    search = RandomizedSearchCV(
-        estimator,
-        param_distributions,
-        scoring='neg_root_mean_squared_error',
-        n_iter=n_iter,
-        cv=5,
-        random_state=42,
-        n_jobs=-1,
-        verbose=1,
-    )
-    search.fit(X, y)
-    best_estimator = search.best_estimator_
-    best_params = search.best_params_
-    best_score = np.sqrt(-search.best_score_)
-    return best_estimator, best_params, best_score
+def run_optuna_lgbm(X, y, n_trials=30):
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_categorical('n_estimators', [200, 400, 600]),
+            'max_depth': trial.suggest_int('max_depth', 3, 7),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 0.9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 2.0),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 2.0),
+        }
+        model = LGBMRegressor(**params, n_jobs=-1, random_state=42)
+        scores = cross_val_score(model, X, y, scoring='neg_root_mean_squared_error', cv=5, n_jobs=-1)
+        return -scores.mean()
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    best_estimator = LGBMRegressor(**study.best_params, n_jobs=-1, random_state=42)
+    return best_estimator, study.best_params, study.best_value
+
+
+def run_optuna_catboost(X, y, n_trials=30):
+    def objective(trial):
+        params = {
+            'iterations': trial.suggest_categorical('iterations', [200, 400, 600]),
+            'depth': trial.suggest_int('depth', 3, 7),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'l2_leaf_reg': trial.suggest_int('l2_leaf_reg', 1, 7),
+            'random_strength': trial.suggest_float('random_strength', 1, 10),
+            'border_count': trial.suggest_categorical('border_count', [32, 64, 128]),
+            'verbose': 0,
+            'thread_count': -1,
+            'random_seed': 42,
+        }
+        model = CatBoostRegressor(**params)
+        scores = cross_val_score(model, X, y, scoring='neg_root_mean_squared_error', cv=5, n_jobs=-1)
+        return -scores.mean()
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    best_params = {k: v for k, v in study.best_params.items() if k not in ['verbose', 'thread_count', 'random_seed']}
+    best_estimator = CatBoostRegressor(**best_params, thread_count=-1, random_seed=42, verbose=0)
+    return best_estimator, best_params, study.best_value
+
+
+def run_optuna_xgb(X, y, n_trials=30):
+    dtrain = xgb.DMatrix(X, label=y.to_numpy())
+
+    def objective(trial):
+        params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'verbosity': 0,
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'max_depth': trial.suggest_int('max_depth', 3, 6),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.9),
+            'min_child_weight': trial.suggest_int('min_child_weight', 10, 30),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.1, 5.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 5.0, log=True),
+        }
+        cv_results = xgb.cv(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=1000,
+            nfold=5,
+            early_stopping_rounds=50,
+            seed=42,
+            verbose_eval=False,
+            as_pandas=True,
+        )
+        trial_rounds = int(cv_results['test-rmse-mean'].idxmin() + 1)
+        trial.set_user_attr('best_rounds', trial_rounds)
+        return cv_results['test-rmse-mean'].min()
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    best_params = study.best_params
+    best_params.update({'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'verbosity': 0})
+    best_rounds = int(study.best_trial.user_attrs.get('best_rounds', 1000))
+    return best_params, best_rounds, study.best_value
 
 
 def ensure_converted_poi(path=CONVERTED_DATA, source=RAW_POI_SOURCE):
@@ -193,13 +266,11 @@ housing = preprocess_housing(housing)
 
 if GEOPANDAS_AVAILABLE:
     try:
-        housing = pl.from_pandas(assign_school_boundaries_to_houses(housing.to_pandas()))
+        housing = assign_school_boundaries_to_houses(housing)
         school_label_cols = [col for col in ['assigned_elementary'] if col in housing.columns]
         if len(school_label_cols) > 0:
-            housing_pd = housing.to_pandas()
             for col in school_label_cols:
-                housing_pd[col] = housing_pd[col].fillna('missing').astype(str)
-            housing = pl.from_pandas(housing_pd)
+                housing[col] = housing[col].fillna('missing').astype(str)
         print('Assigned elementary school boundaries for target encoding.')
     except Exception as e:
         print('Could not assign school boundaries:', e)
@@ -287,18 +358,17 @@ def haversine_distance(lon1, lat1, lon2, lat2):
     return 3958.8 * c
 
 
-def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
+def build_spatial_features(dataset: pd.DataFrame) -> pd.DataFrame:
+    dataset = dataset.copy()
     house_lon = dataset['long'].to_numpy()
     house_lat = dataset['lat'].to_numpy()
 
-    features = {
-        'distance_to_downtown': haversine_distance(
-            house_lon,
-            house_lat,
-            np.full_like(house_lon, -122.3321),
-            np.full_like(house_lat, 47.6062),
-        )
-    }
+    dataset['distance_to_downtown'] = haversine_distance(
+        house_lon,
+        house_lat,
+        np.full_like(house_lon, -122.3321),
+        np.full_like(house_lat, 47.6062),
+    )
 
     def min_dist(category):
         coords = poi_coords.get(category)
@@ -319,12 +389,12 @@ def build_spatial_features(dataset: pl.DataFrame) -> pl.DataFrame:
         return (dist <= radius).sum(axis=1)
 
     for category in category_groups:
-        features[f'min_dist_{category}'] = min_dist(category)
+        dataset[f'min_dist_{category}'] = min_dist(category)
         if category in radius_map:
             for radius in radius_map[category]:
-                features[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
+                dataset[f'count_{category}_{radius:.1f}mi'] = count_within(category, radius)
 
-    return dataset.with_columns([pl.Series(name, values) for name, values in features.items()])
+    return dataset
 
 
 def get_leakage_free_nn_median(train_lat, train_lon, train_price, test_lat, test_lon, k=15):
@@ -428,33 +498,16 @@ xgb_param_distributions = {
 }
 
 print('Tuning LGBM...')
-best_lgbm, best_lgbm_params, best_lgbm_score = run_random_search(
-    LGBMRegressor(n_jobs=-1, random_state=42),
-    lgbm_param_distributions,
-    X_train,
-    y_train,
-    n_iter=20,
-)
+best_lgbm, best_lgbm_params, best_lgbm_score = run_optuna_lgbm(X_train, y_train, n_trials=30)
 print('Tuning CatBoost...')
-best_catboost, best_catboost_params, best_catboost_score = run_random_search(
-    CatBoostRegressor(thread_count=-1, random_seed=42, verbose=0),
-    catboost_param_distributions,
-    X_train,
-    y_train,
-    n_iter=20,
-)
+best_catboost, best_catboost_params, best_catboost_score = run_optuna_catboost(X_train, y_train, n_trials=30)
 print('Tuning XGBoost...')
-best_xgb, best_xgb_params, best_xgb_score = run_random_search(
-    XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42, verbosity=0),
-    xgb_param_distributions,
-    X_train,
-    y_train,
-    n_iter=20,
-)
+best_xgb_params, best_xgb_rounds, best_xgb_score = run_optuna_xgb(X_train, y_train, n_trials=30)
 
 print('Best LGBM params:', best_lgbm_params)
 print('Best CatBoost params:', best_catboost_params)
 print('Best XGBoost params:', best_xgb_params)
+print('Best XGBoost rounds:', best_xgb_rounds)
 ```
 
 # 4. Train Tuned Models
@@ -462,9 +515,16 @@ print('Best XGBoost params:', best_xgb_params)
 ```{python}
 print('Refitting tuned models on the full training set...')
 
-best_lgbm.fit(X_train.to_numpy(), y_train.to_numpy())
-best_catboost.fit(X_train.to_numpy(), y_train.to_numpy())
-best_xgb.fit(X_train.to_numpy(), y_train.to_numpy())
+best_lgbm.fit(X_train, y_train)
+best_catboost.fit(X_train, y_train)
+
+best_xgb = XGBRegressor(
+    n_estimators=best_xgb_rounds,
+    n_jobs=-1,
+    random_state=42,
+    **best_xgb_params
+)
+best_xgb.fit(X_train, y_train)
 ```
 
 # 5. Evaluate the Models and Ensembles
@@ -579,45 +639,43 @@ catboost_importance_df = pd.DataFrame({
 # 6. Holdout Prediction
 
 ```{python}
-mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
 mini_X = preprocess_housing(mini_X)
 
 if GEOPANDAS_AVAILABLE:
     try:
-        mini_X = pl.from_pandas(assign_school_boundaries_to_houses(mini_X.to_pandas()))
+        mini_X = assign_school_boundaries_to_houses(mini_X)
         print('Assigned elementary school boundaries for holdout target encoding.')
     except Exception as e:
         print('Could not assign school boundaries for holdout data:', e)
 else:
     print('geopandas unavailable; skipping holdout school boundary assignment.')
 
-mini_X = build_spatial_features(mini_X)
-mini_X_pd = mini_X.to_pandas()
-
-school_label_cols = [col for col in ['assigned_elementary'] if col in mini_X_pd.columns]
-remaining_school_cols = [col for col in ['assigned_middle', 'assigned_high'] if col in mini_X_pd.columns]
+school_label_cols = [col for col in ['assigned_elementary'] if col in mini_X.columns]
+remaining_school_cols = [col for col in ['assigned_middle', 'assigned_high'] if col in mini_X.columns]
 if remaining_school_cols:
-    mini_X_pd = mini_X_pd.drop(columns=remaining_school_cols)
+    mini_X = mini_X.drop(columns=remaining_school_cols)
 
 for col in school_label_cols:
-    mini_X_pd[col] = mini_X_pd[col].fillna('missing').astype(str)
-    mini_X_pd[f'{col}_score'] = mini_X_pd[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
+    mini_X[col] = mini_X[col].fillna('missing').astype(str)
+    mini_X[f'{col}_score'] = mini_X[col].map(school_target_maps.get(col, {})).fillna(overall_median_price)
 
+mini_X = build_spatial_features(mini_X)
 mini_nn_median = get_leakage_free_nn_median(
     X_train['lat'].to_numpy(),
     X_train['long'].to_numpy(),
     y_train_raw.to_numpy(),
-    mini_X_pd['lat'].to_numpy(),
-    mini_X_pd['long'].to_numpy(),
+    mini_X['lat'].to_numpy(),
+    mini_X['long'].to_numpy(),
     k=15,
 )[1]
-mini_X_pd['nn_median_price'] = mini_nn_median
-mini_X_pd = mini_X_pd[model_feature_cols]
+mini_X['nn_median_price'] = mini_nn_median
+mini_X = mini_X[model_feature_cols]
 
 mini_features = mini_X_pd[model_feature_cols]
-raw_pred_mini_lgbm = best_lgbm.predict(mini_features.to_numpy())
-raw_pred_mini_cat = best_catboost.predict(mini_features.to_numpy())
-raw_pred_mini_xgb = best_xgb.predict(mini_features.to_numpy())
+raw_pred_mini_lgbm = best_lgbm.predict(mini_features)
+raw_pred_mini_cat = best_catboost.predict(mini_features)
+raw_pred_mini_xgb = best_xgb.predict(mini_features)
 
 if use_log_target:
     pred_mini_lgbm = np.exp(raw_pred_mini_lgbm)
@@ -634,7 +692,7 @@ mini_preds = (
     + best_3_weights[2] * pred_mini_xgb
 )
 
-output = pl.DataFrame(mini_preds, schema=['price'])
-output.write_csv('sanhedrin3-module3-predictions.csv')
+output = pd.DataFrame({'price': mini_preds})
+output.to_csv('sanhedrin3-module3-predictions.csv', index=False)
 print('Holdout predictions saved to sanhedrin3-module3-predictions.csv')
 ```

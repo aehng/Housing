@@ -58,6 +58,10 @@ def preprocess_housing(df):
     df = df.copy()
     df = df.drop(columns=['id'])
     df = add_years_since_renovation(df).drop(columns=['yr_renovated'])
+    df['living_to_lot_ratio'] = df['sqft_living'] / df['sqft_lot'].replace(0, 1)
+    df['bed_bath_ratio'] = df['bedrooms'] / df['bathrooms'].replace(0, 0.5)
+    df['sqft_per_bedroom'] = df['sqft_living'] / df['bedrooms'].replace(0, 1)
+    df['basement_proportion'] = df['sqft_basement'] / df['sqft_living'].replace(0, 1)
     df['sqft_living_to_neighbors'] = df['sqft_living'] / df['sqft_living15']
     df = df.drop(columns=['sqft_living', 'zipcode'])
     df['bedrooms'] = np.where(df['bedrooms'] > 30, df['bedrooms'] // 10, df['bedrooms'])
@@ -349,6 +353,7 @@ X_train_pd = X_train
 X_test_pd = X_test
 school_target_maps = {}
 overall_median_price = np.median(y_train_raw.to_numpy())
+m_weight = 10
 for col in school_label_cols:
     if col not in X_train_pd.columns:
         continue
@@ -357,8 +362,16 @@ for col in school_label_cols:
     if col in X_test_pd.columns:
         X_test_pd[col] = X_test_pd[col].fillna('missing').astype(str)
 
-    school_medians = pd.Series(y_train_raw.to_numpy(), index=X_train_pd.index).groupby(X_train_pd[col]).median()
-    school_target_maps[col] = school_medians.to_dict()
+    stats = pd.DataFrame({
+        'count': X_train_pd.groupby(col).size(),
+        'median': pd.Series(y_train_raw.to_numpy(), index=X_train_pd.index).groupby(X_train_pd[col]).median(),
+    })
+    stats['smoothed_score'] = (
+        (stats['count'] * stats['median'] + m_weight * overall_median_price) /
+        (stats['count'] + m_weight)
+    )
+
+    school_target_maps[col] = stats['smoothed_score'].to_dict()
 
     X_train_pd[f'{col}_score'] = X_train_pd[col].map(school_target_maps[col]).fillna(overall_median_price)
     if col in X_test_pd.columns:
@@ -419,7 +432,7 @@ def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_roun
 
 param_grid = {
     'learning_rate': [0.03, 0.05],
-    'max_depth': [3, 4, 5, 6],
+    'max_depth': [3],
     'subsample': [0.6, 0.7, 0.8],
     'colsample_bytree': [0.6, 0.7, 0.8],
     'min_child_weight': [10, 15, 20],
@@ -445,11 +458,11 @@ print({k: v for k, v in best_search['params'].items() if k not in ['objective', 
 xgb_params = {k: v for k, v in best_search['params'].items() if k not in ['objective', 'eval_metric', 'verbosity']}
 ```
 
-# 4. Train Base Model
+# 4. Train Base Model & Select Features
 
 ```{python}
 base_xgb = XGBRegressor(
-    max_depth=5,
+    max_depth=4,
     learning_rate=0.05,
     subsample=0.8,
     colsample_bytree=0.8,
@@ -466,22 +479,29 @@ selector = RFECV(
     n_jobs=-1,
 )
 
-print('Automatically scanning for the optimal features...')
-selector.fit(X_train_pd, y_train.to_numpy())
-
-selected_feature_names = [
-    f for f, keep in zip(X_train_pd.columns, selector.support_) if keep
+core_features = [
+    'bedrooms', 'bathrooms', 'sqft_lot', 'sqft_lot15', 'floors', 'waterfront',
+    'view', 'condition', 'grade', 'sqft_above', 'sqft_basement', 'yr_built',
+    'years_since_renovation', 'lat', 'long', 'living_to_lot_ratio',
+    'bed_bath_ratio', 'sqft_per_bedroom', 'basement_proportion',
+    'sqft_living_to_neighbors', 'month', 'assigned_elementary_score', 'nn_median_price'
 ]
-dropped_feature_names = [
-    f for f, keep in zip(X_train_pd.columns, selector.support_) if not keep
-]
-print(f'Optimal feature count found: {selector.n_features_}')
-print('Features kept:', selected_feature_names)
-print('Features dropped:', dropped_feature_names)
+core_features = [c for c in core_features if c in X_train_pd.columns]
+spatial_features = [c for c in X_train_pd.columns if c not in core_features]
 
-X_train_selected = X_train_pd[selected_feature_names]
-X_test_selected = X_test_pd[selected_feature_names]
-model_feature_cols = selected_feature_names
+print('Automatically scanning for optimal spatial features...')
+selector.fit(X_train_pd[spatial_features], y_train.to_numpy())
+
+surviving_spatial = [f for f, keep in zip(spatial_features, selector.support_) if keep]
+dropped_spatial = [f for f, keep in zip(spatial_features, selector.support_) if not keep]
+
+print(f'Optimal feature count found: {len(core_features) + len(surviving_spatial)}')
+print('Spatial features dropped:', dropped_spatial)
+
+model_feature_cols = core_features + surviving_spatial
+
+X_train_selected = X_train_pd[model_feature_cols]
+X_test_selected = X_test_pd[model_feature_cols]
 
 xgb_model = XGBRegressor(
     n_estimators=best_search['best_rounds'],
@@ -593,7 +613,7 @@ mini_nn_median = get_leakage_free_nn_median(
 mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]
 
-raw_pred_mini_xgb = xgb_model.predict(mini_X.to_numpy())
+raw_pred_mini_xgb = xgb_model.predict(mini_X)
 if use_log_target:
     mini_preds = np.exp(raw_pred_mini_xgb)
 else:
