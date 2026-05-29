@@ -102,13 +102,13 @@ def build_school_target_maps(X_train: pd.DataFrame, y_train: pd.Series, cols, m_
 def run_optuna_lgbm(X, y, n_trials=30):
     def objective(trial):
         params = {
-            'n_estimators': trial.suggest_categorical('n_estimators', [200, 400, 600]),
+            'n_estimators': trial.suggest_int('n_estimators', 200, 800, step=50),
             'max_depth': trial.suggest_int('max_depth', 3, 7),
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'subsample': trial.suggest_float('subsample', 0.6, 0.9),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
-            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 2.0),
-            'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 2.0),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.9),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 2.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 2.0, log=True),
         }
         model = LGBMRegressor(**params, n_jobs=-1, random_state=42)
         scores = cross_val_score(model, X, y, scoring='neg_root_mean_squared_error', cv=5, n_jobs=-1)
@@ -123,12 +123,12 @@ def run_optuna_lgbm(X, y, n_trials=30):
 def run_optuna_catboost(X, y, n_trials=30):
     def objective(trial):
         params = {
-            'iterations': trial.suggest_categorical('iterations', [200, 400, 600]),
+            'iterations': trial.suggest_int('iterations', 200, 800, step=50),
             'depth': trial.suggest_int('depth', 3, 7),
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'l2_leaf_reg': trial.suggest_int('l2_leaf_reg', 1, 7),
+            'l2_leaf_reg': trial.suggest_int('l2_leaf_reg', 1, 20),
             'random_strength': trial.suggest_float('random_strength', 1, 10),
-            'border_count': trial.suggest_categorical('border_count', [32, 64, 128]),
+            'border_count': trial.suggest_int('border_count', 32, 256, step=16),
             'verbose': 0,
             'thread_count': -1,
             'random_seed': 42,

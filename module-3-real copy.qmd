@@ -4,12 +4,13 @@ import pandas as pd
 import numpy as np
 from pyproj import Transformer
 from lets_plot import *
-from sklearn.model_selection import train_test_split, ParameterSampler
+from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import root_mean_squared_error, r2_score
 from sklearn.feature_selection import RFECV
 import xgboost as xgb
 from xgboost import XGBRegressor
+import optuna
 
 try:
     import geopandas as gpd
@@ -384,22 +385,25 @@ X_test_pd = X_test_pd.drop(columns=[col for col in school_label_cols if col in X
 
 # 3c. XGBoost CV-based hyperparameter tuning
 
-def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_rounds=20, random_state=42):
+def xgb_cv_best_params(X, y, n_iter=20, nfold=5, early_stopping_rounds=20, random_state=42):
     dtrain = xgb.DMatrix(X, label=y.to_numpy())
-    param_list = list(ParameterSampler(param_grid, n_iter=n_iter, random_state=random_state))
-    best_score = float('inf')
-    best_result = None
 
-    for trial, params in enumerate(param_list, 1):
-        cv_params = {
+    def objective(trial):
+        params = {
             'objective': 'reg:squarederror',
             'eval_metric': 'rmse',
             'verbosity': 0,
-            **params,
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'max_depth': trial.suggest_int('max_depth', 3, 6),
+            'subsample': trial.suggest_float('subsample', 0.5, 0.9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.9),
+            'min_child_weight': trial.suggest_int('min_child_weight', 10, 25),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.1, 5.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 5.0, log=True),
         }
 
         cv_results = xgb.cv(
-            params=cv_params,
+            params=params,
             dtrain=dtrain,
             num_boost_round=2000,
             nfold=nfold,
@@ -411,39 +415,53 @@ def xgb_cv_best_params(X, y, param_grid, n_iter=20, nfold=5, early_stopping_roun
 
         trial_rmse = cv_results['test-rmse-mean'].min()
         trial_rounds = int(cv_results['test-rmse-mean'].idxmin() + 1)
+        trial.set_user_attr('best_rounds', trial_rounds)
 
         print(
-            f"Trial {trial}/{len(param_list)}: rmse={trial_rmse:.4f}, rounds={trial_rounds}, "
-            f"params={{learning_rate: {params['learning_rate']}, max_depth: {params['max_depth']}, subsample: {params['subsample']}, "
-            f"colsample_bytree: {params['colsample_bytree']}, min_child_weight: {params['min_child_weight']}, "
-            f"reg_alpha: {params['reg_alpha']}, reg_lambda: {params['reg_lambda']}}}"
+            f"Trial {trial.number + 1}/{n_iter}: rmse={trial_rmse:.4f}, rounds={trial_rounds}, "
+            f"params={{learning_rate: {params['learning_rate']:.5f}, max_depth: {params['max_depth']}, subsample: {params['subsample']:.3f}, "
+            f"colsample_bytree: {params['colsample_bytree']:.3f}, min_child_weight: {params['min_child_weight']}, "
+            f"reg_alpha: {params['reg_alpha']:.5f}, reg_lambda: {params['reg_lambda']:.5f}}}"
         )
 
-        if trial_rmse < best_score:
-            best_score = trial_rmse
-            best_result = {
-                'params': cv_params,
-                'best_rounds': trial_rounds,
-                'best_rmse': trial_rmse,
-                'cv_results': cv_results,
-            }
+        return trial_rmse
 
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    study = optuna.create_study(direction='minimize', sampler=sampler)
+    study.optimize(objective, n_trials=n_iter)
+
+    best_trial = study.best_trial
+    best_params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'verbosity': 0,
+        **best_trial.params,
+    }
+    best_rounds = best_trial.user_attrs.get('best_rounds', None)
+    if best_rounds is None:
+        cv_results = xgb.cv(
+            params=best_params,
+            dtrain=dtrain,
+            num_boost_round=2000,
+            nfold=nfold,
+            early_stopping_rounds=early_stopping_rounds,
+            seed=random_state,
+            verbose_eval=False,
+            as_pandas=True,
+        )
+        best_rounds = int(cv_results['test-rmse-mean'].idxmin() + 1)
+
+    best_result = {
+        'params': best_params,
+        'best_rounds': best_rounds,
+        'best_rmse': best_trial.value,
+        'cv_results': None,
+    }
     return best_result
-
-param_grid = {
-    'learning_rate': [0.03, 0.05],
-    'max_depth': [3],
-    'subsample': [0.6, 0.7, 0.8],
-    'colsample_bytree': [0.6, 0.7, 0.8],
-    'min_child_weight': [10, 15, 20],
-    'reg_alpha': [0.5, 1.0, 2.0],
-    'reg_lambda': [1.5, 2.0, 3.0],
-}
 
 best_search = xgb_cv_best_params(
     X_train_pd,
     y_train,
-    param_grid,
     n_iter=20,
     nfold=5,
     early_stopping_rounds=50,
