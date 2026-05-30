@@ -483,7 +483,7 @@ xgb_importance_df = pd.DataFrame({
 # 6. Holdout Prediction
 
 ```{python}
-mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test.csv')
 mini_X = preprocess_housing(mini_X)
 
 mini_X = build_spatial_features(mini_X)

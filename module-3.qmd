@@ -177,7 +177,7 @@ ggplot(residual_df, aes(x='Predicted Price', y='Residual')) + geom_point() + geo
 
 Mini Holdout
 ```{python}
-mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test.csv')
 
 housing = pl.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing.csv')
 

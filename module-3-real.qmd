@@ -11,7 +11,7 @@ from sklearn.linear_model import RidgeCV
 from sklearn.metrics import root_mean_squared_error, r2_score
 from sklearn.feature_selection import RFECV
 from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool 
 import xgboost as xgb
 from xgboost import XGBRegressor
 
@@ -29,6 +29,7 @@ RAW_POI_SOURCE = 'COMMON_INTEREST_POINT_731_-5292713171796621172.csv'
 
 LetsPlot.setup_html()
 use_log_target = True  # Set True to train on log(price) and inverse-transform predictions
+CATBOOST_CAT_FEATURES = ['waterfront', 'view', 'condition', 'grade', 'month']
 ```
 
 # 1. Load Data
@@ -135,7 +136,7 @@ def run_optuna_catboost(X, y, n_trials=30):
             X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-            model.fit(X_tr, y_tr)
+            model.fit(X_tr, y_tr, cat_features=CATBOOST_CAT_FEATURES)
             raw_preds = model.predict(X_val)
 
             if use_log_target:
@@ -468,7 +469,7 @@ xgb_param_distributions = {
 print('Refitting tuned models on the full training set...')
 
 best_lgbm.fit(X_train_selected, y_train)
-best_catboost.fit(X_train_selected, y_train)
+best_catboost.fit(X_train_selected, y_train, cat_features=CATBOOST_CAT_FEATURES)
 
 best_xgb = XGBRegressor(
     n_estimators=best_xgb_rounds,
@@ -483,7 +484,8 @@ best_xgb.fit(X_train_selected, y_train)
 
 ```{python}
 raw_pred_lgbm = best_lgbm.predict(X_test_selected.to_numpy())
-raw_pred_cat = best_catboost.predict(X_test_selected.to_numpy())
+cat_test_pool = Pool(X_test_selected, cat_features=CATBOOST_CAT_FEATURES)
+raw_pred_cat = best_catboost.predict(cat_test_pool)
 raw_pred_xgb = best_xgb.predict(X_test_selected.to_numpy())
 
 if use_log_target:
@@ -588,7 +590,7 @@ catboost_importance_df = pd.DataFrame({
 # 6. Holdout Prediction
 
 ```{python}
-mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test_mini.csv')
+mini_X = pd.read_csv('https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/housing_holdout_test.csv')
 mini_X = preprocess_housing(mini_X)
 mini_X = build_spatial_features(mini_X)
 mini_nn_median = get_leakage_free_nn_median(
@@ -603,7 +605,8 @@ mini_X['nn_median_price'] = mini_nn_median
 mini_X = mini_X[model_feature_cols]
 
 raw_pred_mini_lgbm = best_lgbm.predict(mini_X.to_numpy())
-raw_pred_mini_cat = best_catboost.predict(mini_X.to_numpy())
+cat_mini_pool = Pool(mini_X, cat_features=CATBOOST_CAT_FEATURES)
+raw_pred_mini_cat = best_catboost.predict(cat_mini_pool)
 raw_pred_mini_xgb = best_xgb.predict(mini_X.to_numpy())
 
 if use_log_target:
